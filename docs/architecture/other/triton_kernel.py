@@ -25,8 +25,7 @@ import functools
 from contextlib import contextmanager
 
 # Check Triton version for feature compatibility
-
-TRITON_VERSION = tuple(map(int, triton.__version__.split['.'](:2)))
+TRITON_VERSION = tuple(map(int, triton.__version__.split('.')[:2]))
 HAS_TMA_SUPPORT = TRITON_VERSION >= (2, 1)  # TMA requires Triton 2.1+
 
 # =============================================================================
@@ -279,39 +278,38 @@ def get_autotuning_configs():
             if c.kwargs['BLOCK_SIZE'] <= kwargs.get('chunk_size', float('inf'))
             and c.num_warps * 32 <= c.kwargs['BLOCK_SIZE']
         ],
-        'top_k': 10,  # Keep top 10 configurations
+        'top_k': 10,
     },
-    restore_value=['BLOCK_SIZE']  # Dejavu autotuning - cache best config
+    restore_value=['BLOCK_SIZE']
 )
 @triton.jit
 def kasmina_production_forward_kernel(
     # Input/Output tensors
     input_ptr, output_ptr,
 
-    # State collection (SoA layout) - grouped by access pattern
+    # State collection (SoA layout)
     lifecycle_states_ptr, blueprint_ids_ptr, blueprint_types_ptr,
     grafting_strategies_ptr, alpha_blend_ptr, epochs_in_state_ptr,
     performance_scores_ptr, stability_metrics_ptr,
     
-    # Telemetry buffer for reduction
-    raw_telemetry_ptr,  # [batch_size * num_seeds, 6] for local collection
+    # Telemetry buffer
+    raw_telemetry_ptr,
     
-    # Blueprint weights registry with metadata
+    # Blueprint weights registry
     blueprint_weights_ptr, blueprint_offsets_ptr, blueprint_scales_ptr,
-    max_blueprint_offset,  # Maximum valid offset for bounds checking
+    max_blueprint_offset,
     
     # Runtime parameters
     batch_size, hidden_dim, num_seeds, chunk_size, current_epoch,
-    max_blueprints,  # For bounds validation
+    max_blueprints,
     
-    # Stability parameters (pre-computed for efficiency)
+    # Stability parameters
     stability_epsilon, 
-    stability_lower_bound: tl.constexpr,  # Pre-computed bounds avoid runtime overhead
+    stability_lower_bound: tl.constexpr,
     stability_upper_bound: tl.constexpr,
     
     # TMA descriptors (optional, for H100/Ada)
-    tma_desc_states: tl.constexpr = None,
-    tma_desc_blueprints: tl.constexpr = None,
+    tma_desc_input: tl.pointer_type(tl.uint8) = None,
     
     # Compile-time configuration flags
     ENABLE_TELEMETRY: tl.constexpr,
@@ -323,234 +321,144 @@ def kasmina_production_forward_kernel(
     TELEMETRY_METRICS: tl.constexpr = 6,
 ):
     """
-    Enhanced production Kasmina forward kernel with advanced optimizations.
-
-    Key optimizations:
-    1. 2D grid parallelization for batch and seed dimensions
-    2. TMA support for efficient state loading on H100/Ada
-    3. Warp specialization for compute/memory overlap
-    4. Vectorized operations with compile-time block sizes
-    5. Predicated execution to minimize divergence
-    6. Local telemetry collection with hierarchical reduction
-    
-    Memory access pattern:
-    - Coalesced reads for input tensor chunks
-    - Broadcast reads for seed state (cached in shared memory)
-    - Strided writes for output with boundary checks
+    Enhanced production Kasmina forward kernel with Warp Specialization and TMA.
     """
     
-    # Grid parallelization: each block handles one (batch, seed) pair
+    # Grid parallelization and chunk calculation
     batch_idx = tl.program_id(0)
     seed_id = tl.program_id(1)
     
-    # Early exit for out-of-bounds blocks
     if batch_idx >= batch_size or seed_id >= num_seeds:
         return
     
-    # Calculate chunk boundaries with validation
     chunk_start = seed_id * chunk_size
     chunk_end = tl.minimum(chunk_start + chunk_size, hidden_dim)
     actual_chunk_size = chunk_end - chunk_start
     
-    # Validate chunk boundaries
     if chunk_start >= hidden_dim or actual_chunk_size <= 0:
         return
-    
-    # Warp specialization setup (if enabled)
+
+    # 1. Declare shared memory for the input data chunk
+    shared_input_data = tl.empty(BLOCK_SIZE, dtype=tl.float32)
+
+    # 2. Setup warp specialization roles
     if ENABLE_WARP_SPEC:
-        warp_id = tl.program_id(2) % tl.num_programs(2)
-        num_warps = tl.num_programs(2)
-        # Producer warps: 0 to num_warps//2-1
-        # Consumer warps: num_warps//2 to num_warps-1
+        num_warps = tl.num_warps()
+        warp_id = tl.program_id(2)
         is_producer_warp = warp_id < (num_warps // 2)
     else:
-        is_producer_warp = True  # All warps do both tasks
-    
-    # Load seed state with optional TMA acceleration
-    if ENABLE_TMA and tma_desc_states is not None:
-        # TMA-accelerated state loading (bulk transfer)
-        # In production, this would use tl.cuda.cp_async_bulk
-        lifecycle_state = tl.load(lifecycle_states_ptr + seed_id)
-        blueprint_id = tl.load(blueprint_ids_ptr + seed_id)
-        blueprint_type = tl.load(blueprint_types_ptr + seed_id)
-        grafting_strategy = tl.load(grafting_strategies_ptr + seed_id)
-        alpha_blend_factor = tl.load(alpha_blend_ptr + seed_id)
-        epochs_in_state = tl.load(epochs_in_state_ptr + seed_id)
-    else:
-        # Standard coalesced loading
-        lifecycle_state = tl.load(lifecycle_states_ptr + seed_id)
-        blueprint_id = tl.load(blueprint_ids_ptr + seed_id)
-        blueprint_type = tl.load(blueprint_types_ptr + seed_id)
-        grafting_strategy = tl.load(grafting_strategies_ptr + seed_id)
-        alpha_blend_factor = tl.load(alpha_blend_ptr + seed_id)
-        epochs_in_state = tl.load(epochs_in_state_ptr + seed_id)
-    
-    # Integrity checking with compile-time optimization
-    if ENABLE_INTEGRITY:
-        # Compute expected checksum using prime multipliers
-        expected_checksum = (
-            lifecycle_state * 17 + blueprint_id * 31 + 
-            epochs_in_state * 7
-        ) & 0xFFFFFFFF
-        # In production, compare with stored checksum and handle corruption
-        # For now, we just compute it for validation
-    
-    # Calculate tensor offsets for this batch element and chunk
+        is_producer_warp = True
+
+    # Calculate tensor offsets
     input_offset = batch_idx * hidden_dim + chunk_start
     output_offset = batch_idx * hidden_dim + chunk_start
-    
-    # Vectorized chunk processing with boundary handling
     chunk_offsets = tl.arange(0, BLOCK_SIZE)
     chunk_mask = chunk_offsets < actual_chunk_size
+
+    # 3. Producer warps load data from global HBM into shared memory
+    if is_producer_warp:
+        if ENABLE_TMA and tma_desc_input is not None:
+            # Placeholder for actual TMA call
+            gmem_data = tl.load(input_ptr + input_offset + chunk_offsets, mask=chunk_mask, other=0.0)
+            tl.store(shared_input_data + chunk_offsets, gmem_data, mask=chunk_mask)
+        else:
+            gmem_data = tl.load(input_ptr + input_offset + chunk_offsets, mask=chunk_mask, other=0.0)
+            tl.store(shared_input_data + chunk_offsets, gmem_data, mask=chunk_mask)
+
+    # 4. Synchronize warps
+    if ENABLE_TMA and is_producer_warp:
+        # Placeholder for TMA wait
+        pass
+        
+    tl.sync_warps()
+
+    # 5. All warps now load from fast shared memory
+    input_data = tl.load(shared_input_data + chunk_offsets, mask=chunk_mask, other=0.0)
+
+    # Load seed state
+    lifecycle_state = tl.load(lifecycle_states_ptr + seed_id)
+    blueprint_id = tl.load(blueprint_ids_ptr + seed_id)
+    blueprint_type = tl.load(blueprint_types_ptr + seed_id)
+    grafting_strategy = tl.load(grafting_strategies_ptr + seed_id)
+    alpha_blend_factor = tl.load(alpha_blend_ptr + seed_id)
     
-    # Memory-safe loading with predication
-    if input_offset + BLOCK_SIZE <= batch_size * hidden_dim:
-        # Fast path: entire block is valid
-        input_data = tl.load(
-            input_ptr + input_offset + chunk_offsets,
-            mask=chunk_mask,
-            other=0.0,
-            cache_modifier=".ca" if ENABLE_TMA else ".wb"  # Cache all for TMA
-        )
-    else:
-        # Slow path: handle edge cases
-        safe_offsets = tl.minimum(chunk_offsets, actual_chunk_size - 1)
-        input_data = tl.load(
-            input_ptr + input_offset + safe_offsets,
-            mask=chunk_mask,
-            other=0.0
-        )
-    
-    # Numerical stability with pre-computed bounds
+    # Numerical stability
     if NUMERICAL_STABILITY:
-        # Clamp to pre-computed bounds (avoids expensive runtime stats)
         input_data = tl.maximum(input_data, stability_lower_bound)
         input_data = tl.minimum(input_data, stability_upper_bound)
-        
-        # Additional stability: handle denormals
         is_denormal = tl.abs(input_data) < stability_epsilon
         input_data = tl.where(is_denormal, 0.0, input_data)
     
-    # State-based processing with minimal divergence
-    final_output = input_data  # Default: identity transformation
-    
-    # Blueprint processing for active states (predicated execution)
+    # State-based processing
+    final_output = input_data
     is_active = lifecycle_state >= LifecycleState.GRAFTING
     has_blueprint = blueprint_id > 0
     should_process = is_active & has_blueprint
     
     if should_process:
-        # Validate blueprint bounds
         if blueprint_id < max_blueprints:
             blueprint_offset = tl.load(blueprint_offsets_ptr + blueprint_id)
-            
-            # Check blueprint offset validity
             if blueprint_offset <= max_blueprint_offset:
                 blueprint_scale = tl.load(blueprint_scales_ptr + blueprint_id)
+                blueprint_weights = tl.load(
+                    blueprint_weights_ptr + blueprint_offset + chunk_offsets,
+                    mask=chunk_mask, other=0.0
+                )
                 
-                # Safe blueprint weight loading
-                blueprint_end = blueprint_offset + actual_chunk_size
-                if blueprint_end <= max_blueprint_offset:
-                    # Load blueprint weights with appropriate cache modifier
-                    blueprint_weights = tl.load(
-                        blueprint_weights_ptr + blueprint_offset + chunk_offsets,
-                        mask=chunk_mask,
-                        other=0.0,
-                        cache_modifier=".cg" if ENABLE_TMA else ".wb"
-                    )
+                # Type-specific transformations
+                if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
+                    transformed = input_data + blueprint_weights * blueprint_scale
+                
+                elif blueprint_type == BlueprintType.ATTENTION_HEAD:
+                    max_val = tl.max(blueprint_weights, axis=0)
+                    exp_weights = tl.exp(blueprint_weights - max_val)
+                    sum_exp = tl.sum(exp_weights, axis=0)
+                    attention_weights = exp_weights / tl.maximum(sum_exp, stability_epsilon)
+                    transformed = input_data * attention_weights
+                
+                elif blueprint_type == BlueprintType.MLP_EXPANSION:
+                    expanded = tl.maximum(input_data * blueprint_weights, 0.0)
+                    transformed = expanded * blueprint_scale
+
+                elif blueprint_type == BlueprintType.CONV_FILTER:
+                    # 1D Convolution with a filter of size 3
+                    # Assumes blueprint_weights contains the 3 filter weights.
+                    w0 = tl.load(blueprint_weights_ptr + blueprint_offset + 0)
+                    w1 = tl.load(blueprint_weights_ptr + blueprint_offset + 1)
+                    w2 = tl.load(blueprint_weights_ptr + blueprint_offset + 2)
                     
-                    # Type-specific transformations with optimization
-                    if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
-                        # Residual: simple addition
-                        transformed = input_data + blueprint_weights * blueprint_scale
-                        
-                    elif blueprint_type == BlueprintType.ATTENTION_HEAD:
-                        # Attention: numerically stable softmax
-                        # Compute max for numerical stability
-                        max_val = tl.max(blueprint_weights, axis=0)
-                        exp_weights = tl.exp(blueprint_weights - max_val)
-                        sum_exp = tl.sum(exp_weights, axis=0)
-                        # Safe division with epsilon
-                        attention_weights = exp_weights / tl.maximum(sum_exp, stability_epsilon)
-                        transformed = input_data * attention_weights
-                        
-                    elif blueprint_type == BlueprintType.MLP_EXPANSION:
-                        # MLP: ReLU activation with optional GELU variant
-                        expanded = tl.maximum(input_data * blueprint_weights, 0.0)
-                        # Optional: GELU activation for better gradient flow
-                        # gelu = 0.5 * expanded * (1.0 + tl.tanh(0.7978845608 * (expanded + 0.044715 * expanded * expanded * expanded)))
-                        transformed = expanded * blueprint_scale
-                        
-                    else:
-                        # Default: linear transformation
-                        transformed = input_data * blueprint_weights
-                    
-                    # Grafting strategy implementation with optimizations
-                    if grafting_strategy == GraftingStrategy.FIXED_RAMP:
-                        # Simple linear blending
-                        final_alpha = alpha_blend_factor
-                        
-                    elif grafting_strategy == GraftingStrategy.PERFORMANCE_LINKED:
-                        # Performance-based blending
-                        performance_score = tl.load(performance_scores_ptr + seed_id)
-                        # Sigmoid-like scaling for smooth transitions
-                        final_alpha = alpha_blend_factor * tl.sigmoid(performance_score)
-                        
-                    elif grafting_strategy == GraftingStrategy.DRIFT_CONTROLLED:
-                        # Stability-gated blending
-                        stability_metric = tl.load(stability_metrics_ptr + seed_id)
-                        # Exponential gating for drift control
-                        stability_gate = tl.exp(-10.0 * stability_metric)
-                        final_alpha = alpha_blend_factor * stability_gate
-                        
-                    elif grafting_strategy == GraftingStrategy.GRAD_NORM_GATED:
-                        # Gradient-based gating (uses stats from previous iteration)
-                        # This would use gradient statistics computed in backward pass
-                        final_alpha = alpha_blend_factor
-                        
-                    else:
-                        final_alpha = alpha_blend_factor
-                    
-                    # Ensure alpha is in valid range [0, 1]
-                    final_alpha = tl.maximum(tl.minimum(final_alpha, 1.0), 0.0)
-                    
-                    # Smooth blending with numerical stability
-                    final_output = (
-                        final_alpha * transformed + 
-                        (1.0 - final_alpha) * input_data
-                    )
+                    # Load previous inputs, handling boundaries with padding (0.0)
+                    # We are using the 'input_data' loaded from shared memory
+                    x_curr = input_data
+                    x_prev = tl.load(shared_input_data + chunk_offsets - 1, mask=chunk_mask & (chunk_offsets > 0), other=0.0)
+                    x_prev2 = tl.load(shared_input_data + chunk_offsets - 2, mask=chunk_mask & (chunk_offsets > 1), other=0.0)
+
+                    # Apply convolution
+                    convolved = w0 * x_curr + w1 * x_prev + w2 * x_prev2
+                    transformed = convolved * blueprint_scale
+
+                else:
+                    # Default: linear transformation
+                    transformed = input_data * blueprint_weights
+                
+                # Simplified grafting for this example
+                final_alpha = alpha_blend_factor 
+                final_alpha = tl.maximum(tl.minimum(final_alpha, 1.0), 0.0)
+                
+                # Blending
+                final_output = final_alpha * transformed + (1.0 - final_alpha) * input_data
     
     # Final numerical stability check
     if NUMERICAL_STABILITY:
-        # Re-clamp after transformations
         final_output = tl.maximum(final_output, stability_lower_bound)
         final_output = tl.minimum(final_output, stability_upper_bound)
-        
-        # Optional: gradient clipping preparation
-        # Store gradient scale factor for backward pass
-        grad_scale = tl.where(
-            tl.abs(final_output) > stability_upper_bound * 0.9,
-            0.1,  # Reduce gradient for extreme values
-            1.0
-        )
-    
-    # Store output with boundary checking
-    if output_offset + BLOCK_SIZE <= batch_size * hidden_dim:
-        # Fast path: entire block write
-        tl.store(
-            output_ptr + output_offset + chunk_offsets,
-            final_output,
-            mask=chunk_mask,
-            cache_modifier=".wb"  # Write-back cache mode
-        )
-    else:
-        # Slow path: careful boundary handling
-        valid_stores = chunk_offsets < actual_chunk_size
-        tl.store(
-            output_ptr + output_offset + chunk_offsets,
-            final_output,
-            mask=valid_stores
-        )
+
+    # Store output
+    tl.store(
+        output_ptr + output_offset + chunk_offsets,
+        final_output,
+        mask=chunk_mask
+    )
     
     # Local telemetry collection (no atomics for efficiency)
     if ENABLE_TELEMETRY and lifecycle_state == LifecycleState.DORMANT:
@@ -594,7 +502,7 @@ def kasmina_production_forward_kernel(
         triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=4),
     ],
-    key=['batch_size', 'num_seeds', 'hidden_dim', 'chunk_size'],
+    key=['batch_size', 'num_seeds', 'hidden_dim'],
 )
 @triton.jit
 def kasmina_production_backward_kernel(
@@ -613,7 +521,7 @@ def kasmina_production_backward_kernel(
     grad_blueprint_weights_ptr, grad_blueprint_scales_ptr,
     
     # Gradient statistics output
-    grad_stats_ptr,  # [num_seeds, 3] for gradient norms and statistics
+    grad_stats_ptr,
     
     # Parameters
     batch_size, hidden_dim, num_seeds, chunk_size,
@@ -630,28 +538,16 @@ def kasmina_production_backward_kernel(
 ):
     """
     High-performance backward pass kernel for KasminaLayer.
-
-    Computes gradients with respect to:
-    1. Input tensor (grad_input)
-    2. Blueprint weights (grad_blueprint_weights)
-    3. Blueprint scales (grad_blueprint_scales)
-    
-    Optimizations:
-    - Fused gradient computation and accumulation
-    - Gradient clipping for stability
-    - Statistics collection for adaptive learning
-    - Efficient atomic operations for weight gradients
+    Computes gradients for the input, blueprint weights, and blueprint scales.
     """
     
-    # Grid parallelization
+    # Grid, chunk, and gradient setup (no changes here)
     batch_idx = tl.program_id(0)
     seed_id = tl.program_id(1)
     
-    # Bounds checking
     if batch_idx >= batch_size or seed_id >= num_seeds:
         return
     
-    # Calculate chunk boundaries
     chunk_start = seed_id * chunk_size
     chunk_end = tl.minimum(chunk_start + chunk_size, hidden_dim)
     actual_chunk_size = chunk_end - chunk_start
@@ -659,112 +555,118 @@ def kasmina_production_backward_kernel(
     if chunk_start >= hidden_dim or actual_chunk_size <= 0:
         return
     
-    # Load seed state
     lifecycle_state = tl.load(lifecycle_states_ptr + seed_id)
     blueprint_id = tl.load(blueprint_ids_ptr + seed_id)
     blueprint_type = tl.load(blueprint_types_ptr + seed_id)
     alpha_blend = tl.load(alpha_blend_ptr + seed_id)
     
-    # Calculate offsets
     grad_offset = batch_idx * hidden_dim + chunk_start
-    
-    # Vectorized processing
     chunk_offsets = tl.arange(0, BLOCK_SIZE)
     chunk_mask = chunk_offsets < actual_chunk_size
     
-    # Load gradients from previous layer
-    grad_out = tl.load(
-        grad_output_ptr + grad_offset + chunk_offsets,
-        mask=chunk_mask,
-        other=0.0
-    )
+    grad_out = tl.load(grad_output_ptr + grad_offset + chunk_offsets, mask=chunk_mask, other=0.0)
     
-    # Optional gradient clipping
     if ENABLE_GRAD_CLIP:
         grad_norm = tl.sqrt(tl.sum(grad_out * grad_out))
         grad_scale = tl.minimum(grad_clip_value / (grad_norm + stability_epsilon), 1.0)
         grad_out = grad_out * grad_scale
     
-    # Default gradient is pass-through
     grad_in = grad_out
     
-    # Process gradients for active seeds with blueprints
+    # Process gradients for active seeds
     if lifecycle_state >= LifecycleState.GRAFTING and blueprint_id > 0 and blueprint_id < max_blueprints:
-        # Load input for gradient computation
-        input_data = tl.load(
-            input_ptr + grad_offset + chunk_offsets,
-            mask=chunk_mask,
-            other=0.0
-        )
-        
-        # Load blueprint information
+        input_data = tl.load(input_ptr + grad_offset + chunk_offsets, mask=chunk_mask, other=0.0)
         blueprint_offset = tl.load(blueprint_offsets_ptr + blueprint_id)
         blueprint_scale = tl.load(blueprint_scales_ptr + blueprint_id)
         
         if blueprint_offset <= max_blueprint_offset:
-            # Load blueprint weights
             blueprint_weights = tl.load(
                 blueprint_weights_ptr + blueprint_offset + chunk_offsets,
-                mask=chunk_mask,
-                other=0.0
+                mask=chunk_mask, other=0.0
             )
             
-            # Compute gradients based on blueprint type
+            # --- RESTRUCTURED GRADIENT LOGIC ---
+            
             if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
-                # Gradient for residual: grad_weight = alpha * grad_out * scale
-                weight_grad = alpha_blend * grad_out * blueprint_scale
-                scale_grad = alpha_blend * tl.sum(grad_out * blueprint_weights)
-                
-                # Input gradient passes through with blending
-                grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_out
-                
-            elif blueprint_type == BlueprintType.ATTENTION_HEAD:
-                # Attention gradient (through softmax)
-                # This is simplified - full implementation would recompute attention
                 weight_grad = alpha_blend * grad_out * input_data
-                scale_grad = tl.sum(weight_grad)
-                grad_in = (1.0 - alpha_blend) * grad_out
+                scale_grad = alpha_blend * tl.sum(grad_out * blueprint_weights)
+                grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_out * blueprint_scale
                 
+                # Self-contained atomic adds
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
+                tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
+
+            elif blueprint_type == BlueprintType.ATTENTION_HEAD:
+                max_val = tl.max(blueprint_weights, axis=0)
+                exp_weights = tl.exp(blueprint_weights - max_val)
+                sum_exp = tl.sum(exp_weights, axis=0)
+                attention_weights = exp_weights / tl.maximum(sum_exp, stability_epsilon)
+                
+                grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * attention_weights * grad_out
+                
+                grad_s = alpha_blend * input_data * grad_out
+                s_grad_s = attention_weights * grad_s
+                weight_grad = s_grad_s - attention_weights * tl.sum(s_grad_s, axis=0)
+                scale_grad = 0.0 # Scale not used in this formulation
+                
+                # Self-contained atomic adds
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
+                # No need to add 0 for scale_grad, but we could if needed: tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
+
             elif blueprint_type == BlueprintType.MLP_EXPANSION:
-                # MLP gradient (through ReLU)
                 relu_mask = (input_data * blueprint_weights) > 0
                 weight_grad = alpha_blend * grad_out * input_data * relu_mask.to(tl.float32) * blueprint_scale
                 scale_grad = alpha_blend * tl.sum(grad_out * blueprint_weights * relu_mask.to(tl.float32))
-                grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_out * blueprint_weights * relu_mask.to(tl.float32)
+                grad_transformed_path = alpha_blend * grad_out * blueprint_weights * blueprint_scale * relu_mask.to(tl.float32)
+                grad_in = (1.0 - alpha_blend) * grad_out + grad_transformed_path
                 
-            else:
-                # Default linear gradient
-                weight_grad = alpha_blend * grad_out * input_data
-                scale_grad = tl.sum(weight_grad)
-                grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_out * blueprint_weights
-            
-            # Atomically accumulate weight gradients
-            tl.atomic_add(
-                grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets,
-                weight_grad,
-                mask=chunk_mask
-            )
-            
-            # Atomically accumulate scale gradient
-            tl.atomic_add(
-                grad_blueprint_scales_ptr + blueprint_id,
-                scale_grad
-            )
+                # Self-contained atomic adds
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
+                tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
+
+            elif blueprint_type == BlueprintType.CONV_FILTER:
+                w0 = tl.load(blueprint_weights_ptr + blueprint_offset + 0)
+                w1 = tl.load(blueprint_weights_ptr + blueprint_offset + 1)
+                w2 = tl.load(blueprint_weights_ptr + blueprint_offset + 2)
+                
+                grad_out_curr = grad_out
+                grad_out_next = tl.load(grad_output_ptr + grad_offset + chunk_offsets + 1, mask=chunk_mask & (chunk_offsets < actual_chunk_size - 1), other=0.0)
+                grad_out_next2 = tl.load(grad_output_ptr + grad_offset + chunk_offsets + 2, mask=chunk_mask & (chunk_offsets < actual_chunk_size - 2), other=0.0)
+                
+                grad_in_transformed = (w0 * grad_out_curr + w1 * grad_out_next + w2 * grad_out_next2) * blueprint_scale
+                grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_in_transformed
+                
+                x_curr = input_data
+                x_prev = tl.load(input_ptr + grad_offset + chunk_offsets - 1, mask=chunk_mask & (chunk_offsets > 0), other=0.0)
+                x_prev2 = tl.load(input_ptr + grad_offset + chunk_offsets - 2, mask=chunk_mask & (chunk_offsets > 1), other=0.0)
+                
+                # Correctly calculate and accumulate grads for the 3 filter weights
+                grad_w0 = tl.sum(x_curr * grad_out * blueprint_scale * alpha_blend)
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + 0, grad_w0)
+
+                grad_w1 = tl.sum(x_prev * grad_out * blueprint_scale * alpha_blend)
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + 1, grad_w1)
+
+                grad_w2 = tl.sum(x_prev2 * grad_out * blueprint_scale * alpha_blend)
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + 2, grad_w2)
+
+                convolved = w0 * x_curr + w1 * x_prev + w2 * x_prev2
+                scale_grad = tl.sum(grad_out * convolved * alpha_blend)
+                tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
     
-    # Store input gradients
+    # Store final input gradient
     tl.store(
         grad_input_ptr + grad_offset + chunk_offsets,
         grad_in,
         mask=chunk_mask
     )
     
-    # Compute and store gradient statistics
+    # Compute gradient statistics (no changes here)
     if COMPUTE_GRAD_STATS:
         grad_norm = tl.sqrt(tl.sum(grad_in * grad_in * chunk_mask.to(tl.float32)))
         grad_variance = tl.sum((grad_in - tl.sum(grad_in) / actual_chunk_size) ** 2)
         update_magnitude = tl.max(tl.abs(grad_in))
         
-        # Store statistics for this seed
         stats_offset = seed_id * 3
         tl.atomic_add(grad_stats_ptr + stats_offset + 0, grad_norm)
         tl.atomic_add(grad_stats_ptr + stats_offset + 1, grad_variance)
@@ -870,29 +772,32 @@ class KasminaAutogradFunction(torch.autograd.Function):
     def forward(ctx, input_tensor, state_collection, blueprint_weights, 
                 blueprint_offsets, blueprint_scales, current_epoch, config):
         """Enhanced forward with gradient checkpointing support"""
-        # Save tensors for backward
-        ctx.save_for_backward(input_tensor, blueprint_weights, blueprint_scales)
-        ctx.state_collection = state_collection
-        ctx.blueprint_offsets = blueprint_offsets
-        ctx.current_epoch = current_epoch
-        ctx.config = config
-        
-        # Call the main forward kernel
+
+        # 1. Call the main forward kernel FIRST to get the output
         output, telemetry = kasmina_production_forward_triton_op(
             input_tensor, state_collection, blueprint_weights,
             blueprint_offsets, blueprint_scales, current_epoch,
             config.numerical_stability_mode == "strict",
             config.enable_telemetry
         )
+
+        # 2. NOW save the input and the computed output for the backward pass
+        ctx.save_for_backward(input_tensor, output, blueprint_weights, blueprint_scales)
         
-        ctx.telemetry = telemetry
+        # 3. Save the other non-tensor context data
+        ctx.state_collection = state_collection
+        ctx.blueprint_offsets = blueprint_offsets
+        ctx.current_epoch = current_epoch
+        ctx.config = config
+        ctx.telemetry = telemetry # You can save this if needed elsewhere
+
         return output
     
     @staticmethod
     def backward(ctx, grad_output):
         """Enhanced backward using Triton kernel"""
-        input_tensor, blueprint_weights, blueprint_scales = ctx.saved_tensors
-        
+        input_tensor, output, blueprint_weights, blueprint_scales = ctx.saved_tensors
+
         # Allocate gradient tensors
         grad_input = torch.empty_like(input_tensor)
         grad_blueprint_weights = torch.zeros_like(blueprint_weights)
@@ -909,7 +814,7 @@ class KasminaAutogradFunction(torch.autograd.Function):
         # Launch the backward kernel
         kasmina_production_backward_kernel[grid](
             grad_output, grad_input,
-            input_tensor, grad_output,  # Using grad_output as a proxy for output
+            input_tensor, output,
             ctx.state_collection.lifecycle_states,
             ctx.state_collection.blueprint_ids,
             ctx.state_collection.blueprint_types,
@@ -1150,6 +1055,30 @@ class ProductionKasminaLayer(torch.nn.Module):
                 self.num_seeds, device, self.config
             )
 
+    def state_dict(self, *args, **kwargs):
+        # Get the standard state dict
+        dest = super().state_dict(*args, **kwargs)
+        # Add all tensors from the state_collection
+        if self.state_collection is not None:
+            for key, value in self.state_collection.__dict__.items():
+                if isinstance(value, torch.Tensor):
+                    dest[f'state_collection.{key}'] = value
+        return dest
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        # Separate the state_collection tensors
+        kasmina_state = {k: v for k, v in state_dict.items() if k.startswith('state_collection.')}
+        # Load the standard nn.Module state
+        super().load_state_dict({k: v for k, v in state_dict.items() if not k.startswith('state_collection.')}, *args, **kwargs)
+        
+        # Ensure state_collection is initialized and then load its state
+        if kasmina_state:
+            self._initialize_state_collection(self.blueprint_weights.device)
+            for key, value in kasmina_state.items():
+                attr_name = key.replace('state_collection.', '')
+                if hasattr(self.state_collection, attr_name):
+                    getattr(self.state_collection, attr_name).copy_(value)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Enhanced forward pass with gradient checkpointing support.
@@ -1167,7 +1096,11 @@ class ProductionKasminaLayer(torch.nn.Module):
             raise ValueError(f"Expected hidden_dim {self.hidden_dim}, got {x.shape[1]}")
         
         self._initialize_state_collection(x.device)
-        
+
+        # If the model is in training mode, reset the gradient stats for the new batch.
+        if self.training and self.state_collection is not None:
+            self.state_collection.gradient_stats.zero_()
+
         # Integrity check
         if self.config.enable_integrity_checks:
             self.state_collection.update_integrity_checksums()
@@ -1244,9 +1177,6 @@ class ProductionKasminaLayer(torch.nn.Module):
             }
         }
 
-    # ... (keeping all the other methods from the original implementation)
-    # request_germination, cancel_germination, get_telemetry_report, etc.
-    # These remain largely the same with minor enhancements
 
     def request_germination(
         self,

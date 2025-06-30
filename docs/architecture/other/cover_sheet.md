@@ -12,7 +12,7 @@ The enhanced `ProductionKasminaLayer` implementation addresses all key requireme
 
 **Request**: "Implement a Triton-based Backward Pass to replace the Python loop"
 
-### What Was Changed
+### 1.1 What Was Changed
 
 - **Added `kasmina_production_backward_kernel`**: A fully-featured Triton kernel that handles gradient computation entirely on GPU
 - **Key Features**:
@@ -22,7 +22,7 @@ The enhanced `ProductionKasminaLayer` implementation addresses all key requireme
   - Optional gradient clipping for stability
   - Gradient statistics collection for adaptive learning
 
-### Implementation Details
+### 1.2 Implementation Details
 
 ```python
 @triton.autotune(...)
@@ -33,7 +33,7 @@ def kasmina_production_backward_kernel(...):
     # Gradient clipping and statistics collection
 ```
 
-### Performance Impact
+### 1.3 Performance Impact
 
 - Eliminates CPU-GPU synchronization in backward pass
 - ~10-20x speedup for backward pass (depending on configuration)
@@ -45,14 +45,14 @@ def kasmina_production_backward_kernel(...):
 
 **Request**: "Strengthen TMA Integration for Hopper/Ampere GPUs"
 
-### What Was Changed
+### 2.1 What Was Changed
 
 - **Added `TMADescriptorManager` class**: Manages TMA descriptors for bulk tensor transfers
 - **Hardware Detection**: Automatic detection of TMA-capable GPUs (H100/Ada)
 - **Kernel Integration**: Added TMA parameters and cache modifiers in kernels
 - **Configuration**: `enable_tma` flag with automatic hardware detection
 
-### Implementation Details
+### 2.2 Implementation Details
 
 ```python
 class TMADescriptorManager:
@@ -72,7 +72,7 @@ class TMADescriptorManager:
 
 **Request**: "Enrich autotuning configurations for different architectures"
 
-### What Was Changed
+### 3.1 What Was Changed
 
 - **Dynamic Configuration Generation**: `get_autotuning_configs()` function
 - **Architecture-Specific Tuning**:
@@ -81,7 +81,7 @@ class TMADescriptorManager:
   - Base configs: Range from 32 to 2048 block sizes
 - **Intelligent Pruning**: Configs filtered based on chunk size and warp efficiency
 
-### Configuration Examples
+### 3.2 Configuration Examples
 
 ```python
 # H100-specific (more SMs, better async)
@@ -97,7 +97,7 @@ triton.Config({'BLOCK_SIZE': 256}, num_warps=16, num_stages=5)
 
 **Request**: "Improve code clarity and documentation"
 
-### What Was Changed
+### 4.1 What Was Changed
 
 - **Comprehensive Kernel Documentation**: Added detailed docstrings explaining:
   - Memory access patterns
@@ -108,7 +108,7 @@ triton.Config({'BLOCK_SIZE': 256}, num_warps=16, num_stages=5)
 - **Type Hints**: Enhanced type annotations throughout
 - **Structured Code Organization**: Logical grouping of related functionality
 
-### Example Documentation
+### 4.2 Example Documentation
 
 ```python
 """
@@ -198,7 +198,7 @@ self.performance_stats = {
 
 ## 8. Telemetry Enhancements ✅
 
-### What Was Added
+### 8.1 What Was Added
 
 - **Multiple Reduction Strategies**: mean, max, hierarchical
 - **Configurable via `telemetry_reduction_strategy`**
