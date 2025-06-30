@@ -1,0 +1,185 @@
+# **Tasking: Implement Kasmina Core Rust Interfaces & Data Structures**
+
+* **Ticket:** `ENG-KAS-001`
+* **Component:** `kasmina-operator` (Rust Crate)
+* **Author:** J. Morrissey
+* **Status:** To Do
+
+## 1. Context & Background
+
+This task covers the initial Rust implementation of the core data structures and public interfaces for the `KasminaLayer` operator. This implementation must be a direct translation of the architecture specified in the **Kasmina Detailed Design Document (Chapters 3, 5, 7)** and must adhere to the high-performance principles of **ADR-001**.
+
+As per our architectural decision, data models shared across subsystems via the `Oona` message bus will be defined in a central `contracts` Rust crate. `Kasmina`-specific internal types will be defined within the `kasmina-operator` crate. This task involves creating the foundational Rust structs, enums, and traits upon which the full `KasminaLayer` logic will be built, using the `tch-rs` crate for PyTorch integration.
+
+## 2. Acceptance Criteria
+
+* All specified Rust crates and modules are created with the correct structure and definitions.
+* The project successfully compiles using `cargo build`.
+* Code is well-documented using standard Rust doc comments (`///`), referencing the corresponding entities in the design documents.
+* The public interfaces are defined using traits and structs as specified.
+* The crate definitions are approved and published to the internal registry to unblock dependent tasks for `Tamiyo` and `Oona`.
+
+## 3. Task Breakdown & Technical Specification
+
+### **Task 3.1: Create the Shared `contracts` Crate for System-Wide Messages**
+
+Create a new Rust crate, `contracts`, that will be shared across the `kasmina-operator`, `tamiyo-controller`, and `oona-bus` components. This crate defines the data models for messages sent over the event bus.
+
+**File: `crates/contracts/src/lib.rs`**
+
+```rust
+// crates/contracts/src/lib.rs
+
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+
+/// Read-only struct representing the state of a single logical seed.
+/// NOTE: This is defined here as it's part of the public LayerHealthReport payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogicalSeedState {
+    pub layer_id: i32,
+    pub seed_id: i32,
+    pub lifecycle_state: String,
+    pub active_blueprint_id: Option<String>,
+    pub epochs_in_state: i32,
+}
+
+/**
+ * @brief Telemetry payload published by a KasminaLayer at the end of each epoch.
+ * @note Defines the schema for the 'telemetry.seed.health' Oona topic.
+ */
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerHealthReport {
+    pub layer_id: i32,
+    // Maps a logical seed's ID to its calculated health metrics for this epoch.
+    pub health_metrics_by_seed: HashMap<i32, HashMap<String, f32>>,
+    // Optionally includes full state info for debugging or advanced control.
+    pub seed_states: Vec<LogicalSeedState>,
+}
+
+/**
+ * @brief Control command sent from Tamiyo to a specific KasminaLayer.
+ * @note Defines the schema for the 'control.kasmina.commands' Oona topic.
+ * Also serves as the data structure for direct API calls in Phase 1.
+ */
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KasminaControlCommand {
+    pub target_layer_id: i32,
+    pub target_seed_id: i32,
+    pub command: String, // "request_germination", "cancel_germination"
+    pub blueprint_id: Option<String>,
+    pub grafting_strategy: Option<String>,
+}
+```
+
+### **Task 3.2: Create Kasmina-Specific Types in `kasmina-operator/src/types.rs`**
+
+Within the `kasmina-operator` crate, create a `types.rs` module for data structures and enums used internally.
+
+**File: `crates/kasmina-operator/src/types.rs`**
+
+```rust
+// crates/kasmina-operator/src/types.rs
+
+/// Defines the available, pluggable grafting behaviors that Tamiyo can request.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum GraftingStrategyType {
+    FixedRamp,
+    PerformanceLinked,
+    DriftControlled,
+    GradNormGated,
+}
+
+/// Immutable configuration for all grafting strategies and lifecycle timings.
+/// Loaded from YAML config at the start of a run.
+#[derive(Debug, Copy, Clone)]
+pub struct GraftingConfig {
+    pub fixed_steps: u32,
+    pub high_drift_threshold: f32,
+    pub grad_norm_lower: f32,
+    pub grad_norm_upper: f32,
+    // ... other thresholds
+}
+```
+
+### **Task 3.3: Define the `GraftingStrategy` Trait**
+
+Create a `grafting.rs` module to define the `trait` (interface) for all grafting strategies.
+
+**File: `crates/kasmina-operator/src/grafting.rs`**
+
+```rust
+// crates/kasmina-operator/src/grafting.rs
+
+use crate::types::GraftingConfig;
+use crate::layer::KasminaLayer;
+
+/// Trait defining the behavior for all integration strategies.
+/// Implementers will be owned by a KasminaLayer and operate on a specific logical seed.
+pub trait GraftingStrategy {
+    fn new(layer: &KasminaLayer, seed_id: i32, config: &GraftingConfig) -> Self where Self: Sized;
+
+    /// Calculates and returns the new blending alpha value for the current step.
+    fn update(&mut self) -> f32;
+}
+```
+
+### **Task 3.4: Define the `KasminaLayer` Public Rust Interface**
+
+Create the main `layer.rs` module, defining the `KasminaLayer` struct. Note the use of `tch::nn::Module` for PyTorch integration via the `tch-rs` crate.
+
+**File: `crates/kasmina-operator/src/layer.rs`**
+
+```rust
+// crates/kasmina-operator/src/layer.rs
+
+use tch::{nn, Tensor};
+use crate::types::*;
+use contracts::{KasminaControlCommand, LayerHealthReport};
+
+/// The high-performance struct that manages and executes the adaptation
+/// lifecycle for a layer of logical seeds in a vectorized manner.
+#[derive(Debug)]
+pub struct KasminaLayer {
+    layer_id: i32,
+    // Internal state tensor holding lifecycle state, blueprint IDs, etc. for all seeds.
+    state_tensor: Tensor,
+    // Raw buffer for accumulating telemetry stats on the GPU.
+    telemetry_buffer: Tensor,
+    // Other members like the blueprint registry, config, etc.
+}
+
+impl KasminaLayer {
+    pub fn new(vs: &nn::Path, layer_id: i32, num_seeds: i32, chunk_dim: i32) -> Self {
+        // Initialization logic for tensors and other members
+        unimplemented!()
+    }
+
+    // --- Public Control API (called by Tamiyo) ---
+
+    /// Initiates the germination lifecycle for a specific logical seed.
+    pub fn request_germination(&mut self, command: &KasminaControlCommand) -> Result<(), String> {
+        unimplemented!()
+    }
+
+    /// Cancels a pending germination/training request for a logical seed.
+    pub fn cancel_germination(&mut self, command: &KasminaControlCommand) -> Result<(), String> {
+        unimplemented!()
+    }
+    
+    // --- Public Telemetry Method ---
+
+    /// Consolidates GPU buffer and returns the structured health report.
+    pub fn get_telemetry_report(&self) -> LayerHealthReport {
+        unimplemented!()
+    }
+}
+
+// Implement the torch::nn::Module trait for KasminaLayer
+impl nn::Module for KasminaLayer {
+    fn forward(&self, xs: &Tensor) -> Tensor {
+        // Main forward pass executed by the Triton kernel (or equivalent Rust-based GPU code).
+        unimplemented!()
+    }
+}
+```
