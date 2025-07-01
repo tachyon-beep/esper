@@ -1,0 +1,221 @@
+# **Tasking: Implement Kasmina Core Python Interfaces & Data Structures**
+
+* **Ticket:** `ENG-KAS-001` (Revised)
+* **Component:** `kasmina_operator` (Python Package)
+* **Author:** J. Morrissey, Gemini AI
+* **Status:** To Do
+
+## 1\. Context & Background
+
+This task covers the initial Python implementation of the core data structures and public interfaces for the `KasminaLayer` operator. This implementation must be a direct translation of the architecture specified in the **Kasmina Detailed Design Document**, incorporating the advanced requirements of the **JIT Compilation Engine** and adhering to the high-performance principles of **ADR-001**.
+
+Following a strategic pivot, the `KasminaLayer` and its high-performance kernels will be implemented in Python (leveraging frameworks like Triton) to align with the Python-based `Tamiyo` controller and the broader ML ecosystem.
+
+As such, data models shared across subsystems will be defined in a central `contracts.py` Python module using Pydantic for runtime validation and clarity. This task involves creating the foundational Python classes, enums, and abstract base classes upon which the full `KasminaLayer` logic will be built.
+
+## 2\. Acceptance Criteria
+
+* All specified Python packages and modules are created with the correct structure and definitions.
+* The project is type-checked successfully using a tool like `mypy`.
+* All tests pass using `pytest`.
+* Code is well-documented using standard Python docstrings, referencing the corresponding entities in the design documents.
+* The public interfaces are defined using classes and abstract base classes as specified.
+* The `contracts.py` module is approved and published to the internal registry to unblock dependent tasks for `Tamiyo`.
+
+## 3\. Task Breakdown & Technical Specification
+
+### **Task 3.1: Create the Shared `contracts.py` Module**
+
+Create a new Python module, `contracts.py`, that will be shared across the `kasmina_operator` and `tamiyo_controller` components. This module defines the Pydantic data models for all shared data structures.
+
+**File: `esper/contracts.py`**
+
+```python
+# esper/contracts.py
+
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Tuple
+
+class LogicalSeedState(BaseModel):
+    """Read-only struct representing the state of a single logical seed."""
+    layer_id: int
+    seed_id: int
+    lifecycle_state: str
+    active_blueprint_id: Optional[str] = None
+    epochs_in_state: int
+
+class LayerHealthReport(BaseModel):
+    """
+    Telemetry payload published by a KasminaLayer at the end of each epoch.
+    Defines the schema for the 'telemetry.seed.health' Oona topic.
+    """
+    layer_id: int
+    # Maps a logical seed's ID to its calculated health metrics for this epoch.
+    health_metrics_by_seed: Dict[int, Dict[str, float]]
+    # Optionally includes full state info for debugging or advanced control.
+    seed_states: List[LogicalSeedState]
+
+class KasminaControlCommand(BaseModel):
+    """
+    Control command sent from Tamiyo to a specific KasminaLayer.
+    This contract is updated to support the JIT Compilation Engine.
+    """
+    target_layer_id: int
+    target_seed_id: int
+    command: str  # e.g., "request_germination", "cancel_germination"
+
+    # The canonical hash of the blueprint's IR. This serves as the unique
+    # identifier for a specific architecture and is used as the primary
+    # key for caching compiled kernels in the KernelRegistry.
+    blueprint_id: str
+
+    # The full, serialized BlueprintIR graph for novel blueprints that
+    # require on-the-fly JIT compilation by the Kasmina operator.
+    # - `Some(ir_bytes)`: For novel blueprints. Kasmina will use this to compile a new kernel.
+    # - `None`: For known blueprints. Kasmina will look up the pre-compiled kernel.
+    blueprint_ir: Optional[bytes] = None
+
+    # The grafting strategy to be used by Kasmina. This is non-optional
+    # for a germination request to ensure explicit control.
+    grafting_strategy: str
+```
+
+### **Task 3.2: Create Kasmina-Specific Types in `kasmina_operator/types.py`**
+
+Within the `kasmina_operator` package, create a `types.py` module for internal data structures.
+
+**File: `kasmina_operator/types.py`**
+
+```python
+# kasmina_operator/types.py
+
+from enum import Enum
+from dataclasses import dataclass
+
+class GraftingStrategyType(Enum):
+    """Defines the available, pluggable grafting behaviors that Tamiyo can request."""
+    FIXED_RAMP = "FixedRamp"
+    PERFORMANCE_LINKED = "PerformanceLinked"
+    DRIFT_CONTROLLED = "DriftControlled"
+    GRAD_NORM_GATED = "GradNormGated"
+
+@dataclass(frozen=True)
+class GraftingConfig:
+    """
+    Immutable configuration for all grafting strategies and lifecycle timings.
+    Loaded from a YAML config file at the start of a run.
+    """
+    fixed_steps: int
+    high_drift_threshold: float
+    grad_norm_lower: float
+    grad_norm_upper: float
+    # ... other thresholds
+```
+
+### **Task 3.3: Define the `GraftingStrategy` Abstract Base Class**
+
+Create a `grafting.py` module to define the interface for all grafting strategies using Python's `abc` module.
+
+**File: `kasmina_operator/grafting.py`**
+
+```python
+# kasmina_operator/grafting.py
+
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
+from .types import GraftingConfig
+
+# Forward reference to avoid circular import
+if TYPE_CHECKING:
+    from .layer import KasminaLayer
+
+class BaseGraftingStrategy(ABC):
+    """
+    Abstract base class defining the interface for all integration strategies.
+    Implementers will be owned by a KasminaLayer and operate on a specific logical seed.
+    """
+    def __init__(self, layer: "KasminaLayer", seed_id: int, config: GraftingConfig):
+        self.layer = layer
+        self.seed_id = seed_id
+        self.config = config
+
+    @abstractmethod
+    def update(self) -> float:
+        """Calculates and returns the new blending alpha value for the current step."""
+        ...
+```
+
+### **Task 3.4: Define the `KasminaLayer` Public Python Interface**
+
+Create the main `layer.py` module, defining the `KasminaLayer` class inheriting from `torch.nn.Module`.
+
+**File: `kasmina_operator/layer.py`**
+
+```python
+# kasmina_operator/layer.py
+
+import torch
+from torch import nn
+from typing import Dict, Any
+
+from esper.contracts import KasminaControlCommand, LayerHealthReport
+
+class KasminaLayer(nn.Module):
+    """
+    The high-performance nn.Module that manages and executes the adaptation
+    lifecycle for a layer of logical seeds in a vectorized manner.
+    """
+    def __init__(self, layer_id: int, num_seeds: int, chunk_dim: int):
+        """
+        Initializes the KasminaLayer.
+        - layer_id: The index of the host model layer this operator manages.
+        - num_seeds: The number of logical seeds (chunks) this layer contains.
+        - chunk_dim: The feature dimension of each chunk.
+        """
+        super().__init__()
+        self.layer_id = layer_id
+        # Internal state tensor holding lifecycle state, blueprint IDs, etc. for all seeds.
+        self.state_tensor: torch.Tensor = torch.zeros((num_seeds, 4), dtype=torch.int32)
+        # Raw buffer for accumulating telemetry stats on the GPU.
+        self.telemetry_buffer: torch.Tensor = torch.zeros((num_seeds, 2))
+        # ... other members like the JIT kernel registry, config, etc.
+
+    # --- Public Control API (called by Tamiyo) ---
+
+    def request_germination(self, command: KasminaControlCommand) -> bool:
+        """
+        Initiates the germination lifecycle for a specific logical seed based on
+        a command from Tamiyo.
+        """
+        # Implementation to validate command and update state_tensor
+        print(f"Received germination request for seed {command.target_seed_id} with blueprint {command.blueprint_id}")
+        return True # Return True on success
+
+    def cancel_germination(self, command: KasminaControlCommand) -> bool:
+        """
+        Cancels a pending germination/training request for a logical seed.
+        """
+        # Implementation to update state_tensor
+        print(f"Received cancel request for seed {command.target_seed_id}")
+        return True # Return True on success
+
+    # --- Public Telemetry Method ---
+
+    def get_telemetry_report(self) -> LayerHealthReport:
+        """
+        Consolidates the raw GPU telemetry_buffer into a structured report
+        at the end of an epoch for transport via Oona.
+        """
+        # Implementation to process buffer and build LayerHealthReport
+        raise NotImplementedError
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        """
+
+        Executes the main forward pass. In a real implementation, this would
+        launch the high-performance Triton kernel, which reads the state_tensor
+        and telemetry_buffer to perform its vectorized logic.
+        """
+        # Placeholder logic: identity function
+        return xs
+```

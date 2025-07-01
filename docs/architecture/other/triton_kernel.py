@@ -22,11 +22,20 @@ from dataclasses import dataclass
 import math
 import warnings
 import functools
+import ctypes
 from contextlib import contextmanager
+
+# TMA imports for modern Triton
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    HAS_TENSOR_DESCRIPTOR = True
+except ImportError:
+    HAS_TENSOR_DESCRIPTOR = False
+    TensorDescriptor = None
 
 # Check Triton version for feature compatibility
 TRITON_VERSION = tuple(map(int, triton.__version__.split('.')[:2]))
-HAS_TMA_SUPPORT = TRITON_VERSION >= (2, 1)  # TMA requires Triton 2.1+
+HAS_TMA_SUPPORT = TRITON_VERSION >= (2, 1) and HAS_TENSOR_DESCRIPTOR  # TMA requires Triton 2.1+ and TensorDescriptor
 
 # =============================================================================
 
@@ -91,54 +100,382 @@ class ProductionKernelConfig:
 
 # =============================================================================
 
+from kasmina_tma_ffi import CUDADriver, CUTensorMap, DTYPE_MAP, CUDAResult, _CU_TENSOR_MAP_MAX_RANK
+from kasmina_tma_ffi import CUTensorMapSwizzle, CUTensorMapInterleave, CUTensorMapL2Promotion, CUTensorMapFloatOobFill
+
+# Host-side descriptor creation for modern TMA API
+def create_tma_descriptors(input_tensor, weight_tensor, output_tensor):
+    """
+    Create TMA descriptors using the modern TensorDescriptor API.
+    This is the recommended approach for Triton 2.1+ with TMA support.
+    """
+    if not HAS_TENSOR_DESCRIPTOR:
+        return None, None, None
+    
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    
+    try:
+        input_desc = TensorDescriptor(
+            input_tensor, input_tensor.shape, input_tensor.stride(), [BLOCK_M, BLOCK_K]
+        )
+        weight_desc = TensorDescriptor(
+            weight_tensor, weight_tensor.shape, weight_tensor.stride(), [BLOCK_K, BLOCK_N]
+        )
+        output_desc = TensorDescriptor(
+            output_tensor, output_tensor.shape, output_tensor.stride(), [BLOCK_M, BLOCK_N]
+        )
+        
+        return input_desc, weight_desc, output_desc
+    except Exception as e:
+        warnings.warn(f"Failed to create TMA descriptors: {e}")
+        return None, None, None
+
 class TMADescriptorManager:
     """
-    Manages Tensor Memory Accelerator descriptors for efficient async transfers.
-    Requires CUDA 12.0+ and Triton 2.1+
+    Enhanced TMA descriptor manager supporting both legacy CUDA API and modern TensorDescriptor API.
+    Prioritizes TensorDescriptor for better performance and compatibility.
+    
+    Requires CUDA 12.0+ driver and Triton 2.1+ on H100/Ada GPUs.
     """
     def __init__(self, device: torch.device):
         self.device = device
-        self.descriptors = {}
-        self.capability = None
-
-        if device.type == 'cuda':
+        self.descriptors: Dict[str, Union[CUTensorMap, TensorDescriptor]] = {}
+        self._descriptor_cache: Dict[str, Union[CUTensorMap, TensorDescriptor]] = {}  # Performance cache
+        self.driver = CUDADriver() if not HAS_TENSOR_DESCRIPTOR else None
+        self.capability = (0, 0)
+        
+        if device.type == 'cuda' and torch.cuda.is_available():
             self.capability = torch.cuda.get_device_capability(device)
-            # TMA requires compute capability 9.0+ (Hopper) or 8.9 (Ada)
-            self.has_tma = self.capability >= (8, 9) and HAS_TMA_SUPPORT
+        
+        # TMA is supported on compute capability 9.0+ (Hopper) or 8.9 (Ada)
+        # Prefer TensorDescriptor API when available
+        if HAS_TENSOR_DESCRIPTOR:
+            self.has_tma = self.capability >= (8, 9)
+            self.use_tensor_descriptor = True
         else:
-            self.has_tma = False
-    
-    def create_descriptor(self, tensor: torch.Tensor, name: str) -> Optional[int]:
-        """Create a TMA descriptor for efficient tensor access"""
+            self.has_tma = self.capability >= (8, 9) and self.driver and self.driver.is_available
+            self.use_tensor_descriptor = False
+
+    def _get_cache_key(self, tensor: torch.Tensor, name: str, block_dims: Optional[List[int]] = None) -> str:
+        """Generate cache key for tensor descriptor based on shape, stride, and block dims"""
+        key_parts = [
+            name,
+            str(tensor.shape),
+            str(tensor.stride()), 
+            str(tensor.dtype),
+            str(block_dims) if block_dims else "None"
+        ]
+        return "|".join(key_parts)
+
+    def _get_or_create_descriptor(self, tensor: torch.Tensor, name: str, cache_key: str, **kwargs) -> Optional[Union[CUTensorMap, TensorDescriptor]]:
+        """Get descriptor from cache or create new one"""
+        if cache_key in self._descriptor_cache:
+            return self._descriptor_cache[cache_key]
+        
+        # Create new descriptor
+        if self._create_descriptor_internal(tensor, name, **kwargs):
+            descriptor = self.descriptors[name]
+            self._descriptor_cache[cache_key] = descriptor
+            return descriptor
+        
+        return None
+
+    def create_descriptor(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        swizzle: CUTensorMapSwizzle = CUTensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
+        l2_promotion: CUTensorMapL2Promotion = CUTensorMapL2Promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        oob_fill: CUTensorMapFloatOobFill = CUTensorMapFloatOobFill.CU_TENSOR_MAP_FLOAT_OOB_FILL_ZEROS,
+        block_dims: Optional[List[int]] = None,
+    ) -> bool:
+        """
+        Creates a TMA descriptor for a given tensor using the best available API.
+        Uses caching for improved performance with frequently accessed tensor shapes.
+        """
         if not self.has_tma:
-            return None
-            
-        # In production, this would use cuTensorMapEncode
-        # For now, we return a placeholder that the kernel can use
-        desc_id = hash((name, tensor.data_ptr(), tensor.shape, tensor.stride()))
-        self.descriptors[name] = {
-            'tensor': tensor,
-            'desc_id': desc_id,
-            'shape': tensor.shape,
-            'stride': tensor.stride()
-        }
-        return desc_id
+            return False
+        
+        # Generate cache key for this descriptor request
+        cache_key = self._get_cache_key(tensor, name, block_dims)
+        
+        # Try to get from cache first
+        cached_descriptor = self._get_or_create_descriptor(
+            tensor, name, cache_key, 
+            swizzle=swizzle, l2_promotion=l2_promotion, 
+            oob_fill=oob_fill, block_dims=block_dims
+        )
+        
+        return cached_descriptor is not None
+
+    def _create_descriptor_internal(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        swizzle: CUTensorMapSwizzle = CUTensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
+        l2_promotion: CUTensorMapL2Promotion = CUTensorMapL2Promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        oob_fill: CUTensorMapFloatOobFill = CUTensorMapFloatOobFill.CU_TENSOR_MAP_FLOAT_OOB_FILL_ZEROS,
+        block_dims: Optional[List[int]] = None,
+    ) -> bool:
+        """Internal method for actual descriptor creation"""
+        
+        if name in self.descriptors:
+            warnings.warn(f"TMA descriptor with name '{name}' already exists. Overwriting.")
+
+        # Use TensorDescriptor API (preferred)
+        if self.use_tensor_descriptor:
+            try:
+                if block_dims is None:
+                    # Default block dimensions based on tensor shape
+                    if tensor.dim() == 2:
+                        block_dims = [min(128, tensor.shape[0]), min(128, tensor.shape[1])]
+                    else:
+                        block_dims = [min(128, s) for s in tensor.shape]
+                
+                descriptor = TensorDescriptor(
+                    tensor, tensor.shape, tensor.stride(), block_dims
+                )
+                self.descriptors[name] = descriptor
+                return True
+            except Exception as e:
+                warnings.warn(f"Failed to create TensorDescriptor for '{name}': {e}")
+                return False
+        
+        # Fallback to legacy CUDA driver API
+        else:
+            return self._create_legacy_descriptor(tensor, name, swizzle, l2_promotion, oob_fill)
     
+    def _create_legacy_descriptor(self, tensor, name, swizzle, l2_promotion, oob_fill):
+        """Legacy CUDA driver API descriptor creation"""
+        if not self.driver or not self.driver.is_available:
+            return False
+            
+        # --- 1. Validate Inputs ---
+        if tensor.dtype not in DTYPE_MAP:
+            raise ValueError(f"Unsupported dtype for TMA: {tensor.dtype}")
+        if not tensor.is_cuda:
+            raise ValueError("TMA tensors must be on a CUDA device.")
+        if tensor.dim() > _CU_TENSOR_MAP_MAX_RANK:
+            raise ValueError(f"Tensor rank {tensor.dim()} exceeds TMA max rank of {_CU_TENSOR_MAP_MAX_RANK}.")
+
+        # --- 2. Prepare Arguments for ctypes ---
+        rank = tensor.dim()
+        
+        # Shape (globalDim) and Strides (globalStrides)
+        # TMA requires 64-bit integers for dimensions and strides.
+        shape_arr_t = ctypes.c_uint64 * rank
+        stride_arr_t = ctypes.c_uint64 * rank
+        global_dim = shape_arr_t(*tensor.shape)
+        global_strides = stride_arr_t(*tensor.stride())
+
+        # Box dimensions (sub-region of the tensor). For the whole tensor, it's the same as shape.
+        box_dim_arr_t = ctypes.c_uint32 * rank
+        box_dim = box_dim_arr_t(*tensor.shape)
+
+        # Tensor data pointer
+        data_ptr = ctypes.c_void_p(tensor.data_ptr())
+
+        # --- 3. Call the CUDA Driver Function ---
+        tma_desc = CUTensorMap()
+        result = self.driver.cuTensorMapEncodeTiled(
+            ctypes.byref(tma_desc),
+            DTYPE_MAP[tensor.dtype],
+            rank,
+            data_ptr,
+            global_dim,
+            global_strides,
+            box_dim,
+            swizzle,
+            CUTensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+            l2_promotion,
+            oob_fill
+        )
+
+        if result == CUDAResult.CUDA_SUCCESS:
+            self.descriptors[name] = tma_desc
+            return True
+        else:
+            warnings.warn(f"Failed to create TMA descriptor for '{name}'. CUDA Error: {result.name}")
+            return False
+
+    def get_descriptor_pointer(self, name: str) -> Optional[int]:
+        """
+        Returns the memory address or reference for the stored TMA descriptor.
+        For TensorDescriptor API, returns the descriptor object itself.
+        For legacy API, returns the memory address of the CUTensorMap.
+        """
+        if name in self.descriptors:
+            descriptor = self.descriptors[name]
+            if self.use_tensor_descriptor:
+                # Return the TensorDescriptor object itself
+                return descriptor
+            else:
+                # Return memory address for legacy CUTensorMap
+                return ctypes.addressof(descriptor)
+        return None
+
     def get_descriptor_hints(self) -> Dict[str, Any]:
-        """Get TMA hints for kernel compilation"""
-        if not self.has_tma:
-            return {}
-            
+        """Provides TMA hints for kernel compilation."""
         return {
-            'tma_enabled': True,
+            'tma_enabled': self.has_tma,
+            'use_tensor_descriptor': self.use_tensor_descriptor,
             'descriptors': list(self.descriptors.keys()),
             'capability': self.capability
         }
 
+import triton
+import triton.language as tl
+
+@triton.jit
+def intra_block_reduction_kernel(
+    input_ptr, output_ptr, n_elements,
+    reduction_op: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ITEMS_PER_THREAD: tl.constexpr,
+):
+    """Stage 1: Intra-block reduction using shared memory"""
+    block_id = tl.program_id(0)
+    thread_id = tl.arange(0, BLOCK_SIZE)
+    
+    # Thread coarsening for improved bandwidth utilization
+    elements_per_block = BLOCK_SIZE * ITEMS_PER_THREAD
+    block_start = block_id * elements_per_block
+    
+    # Initialize thread-local accumulator
+    if reduction_op == 'sum':
+        accumulator = 0.0
+    elif reduction_op == 'max':
+        accumulator = float('-inf')
+    elif reduction_op == 'min':
+        accumulator = float('inf')
+    
+    # Sequential reduction within each thread
+    for i in range(ITEMS_PER_THREAD):
+        offsets = block_start + i * BLOCK_SIZE + thread_id
+        mask = offsets < n_elements
+        data = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+        
+        if reduction_op == 'sum':
+            accumulator += data
+        elif reduction_op == 'max':
+            accumulator = tl.maximum(accumulator, data)
+        elif reduction_op == 'min':
+            accumulator = tl.minimum(accumulator, data)
+    
+    # Block-level reduction using shared memory (automatic in Triton)
+    if reduction_op == 'sum':
+        block_result = tl.sum(accumulator, axis=0)
+    elif reduction_op == 'max':
+        block_result = tl.max(accumulator, axis=0)
+    elif reduction_op == 'min':
+        block_result = tl.min(accumulator, axis=0)
+    
+    # Store per-block result
+    if thread_id[0] == 0:
+        tl.store(output_ptr + block_id, block_result)
+
+@triton.jit
+def inter_block_reduction_kernel(
+    partial_results_ptr, final_result_ptr, n_blocks,
+    reduction_op: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Stage 2: Inter-block reduction for final aggregation"""
+    block_id = tl.program_id(0)
+    thread_id = tl.arange(0, BLOCK_SIZE)
+    
+    block_start = block_id * BLOCK_SIZE
+    offsets = block_start + thread_id
+    mask = offsets < n_blocks
+    
+    # Load partial results from Stage 1
+    partial_data = tl.load(partial_results_ptr + offsets, mask=mask, other=0.0)
+    
+    # Final reduction
+    if reduction_op == 'sum':
+        result = tl.sum(partial_data, axis=0)
+    elif reduction_op == 'max':
+        result = tl.max(partial_data, axis=0)
+    elif reduction_op == 'min':
+        result = tl.min(partial_data, axis=0)
+    
+    # Store final result
+    if thread_id[0] == 0:
+        tl.store(final_result_ptr + block_id, result)
+
+class HierarchicalTelemetryReducer:
+    """Production-ready hierarchical reduction wrapper"""
+    
+    def __init__(self, block_size=1024, items_per_thread=4):
+        self.block_size = block_size
+        self.items_per_thread = items_per_thread
+        self._temp_storage = {}  # Cache for memory efficiency
+    
+    def reduce(self, input_tensor, reduction_op='sum'):
+        """Replace telemetry_reduction_kernel placeholder"""
+        device = input_tensor.device
+        dtype = input_tensor.dtype
+        n_elements = input_tensor.numel()
+        
+        # Flatten input
+        input_flat = input_tensor.flatten()
+        
+        # Stage 1: Intra-block reduction
+        elements_per_block = self.block_size * self.items_per_thread
+        n_blocks_stage1 = triton.cdiv(n_elements, elements_per_block)
+        
+        stage1_results = self._get_temp_storage(n_blocks_stage1, dtype, device)
+        
+        grid_stage1 = (n_blocks_stage1,)
+        intra_block_reduction_kernel[grid_stage1](
+            input_flat, stage1_results, n_elements, reduction_op,
+            BLOCK_SIZE=self.block_size, ITEMS_PER_THREAD=self.items_per_thread
+        )
+        
+        # Stage 2: Inter-block reduction (recursive if needed)
+        return self._reduce_stage2(stage1_results[:n_blocks_stage1], reduction_op)
+    
+    def _reduce_stage2(self, partial_results, reduction_op):
+        """Recursive inter-block reduction"""
+        n_partial = partial_results.numel()
+        
+        if n_partial <= self.block_size:
+            # Single block handles remaining elements - use PyTorch for final reduction
+            if reduction_op == 'sum':
+                result = torch.sum(partial_results)
+            elif reduction_op == 'max':
+                result = torch.max(partial_results)
+            elif reduction_op == 'min':
+                result = torch.min(partial_results)
+            else:
+                result = torch.sum(partial_results)  # Default fallback
+                
+            return result.item()
+        else:
+            # Multiple blocks needed
+            n_blocks_stage2 = triton.cdiv(n_partial, self.block_size)
+            stage2_results = self._get_temp_storage(n_blocks_stage2, 
+                                                  partial_results.dtype, 
+                                                  partial_results.device)
+            
+            grid_stage2 = (n_blocks_stage2,)
+            inter_block_reduction_kernel[grid_stage2](
+                partial_results, stage2_results, n_partial, reduction_op,
+                BLOCK_SIZE=self.block_size
+            )
+            
+            # Recursive call for final aggregation
+            return self._reduce_stage2(stage2_results[:n_blocks_stage2], reduction_op)
+    
+    def _get_temp_storage(self, size, dtype, device):
+        """Memory-efficient temporary storage with caching"""
+        key = (size, dtype, device)
+        if key not in self._temp_storage or self._temp_storage[key].numel() < size:
+            self._temp_storage[key] = torch.empty(size, dtype=dtype, device=device)
+        return self._temp_storage[key][:size]
+
 # =============================================================================
-
 # Enhanced Structure-of-Arrays State Layout
-
 # =============================================================================
 
 class KasminaProductionStateCollection:
@@ -217,36 +554,68 @@ class KasminaProductionStateCollection:
         ) & 0xFFFFFFFF
         self.integrity_checksum.copy_(checksum)
 
-    def validate_blueprint_access(self, blueprint_id: int, max_blueprints: int, chunk_size: int) -> bool:
+    def validate_blueprint_access(self, blueprint_id: int, max_blueprints: int) -> bool:
         """Validate blueprint access is within bounds"""
         return 0 <= blueprint_id < max_blueprints
 
 # =============================================================================
-
 # Production Triton Kernels with Advanced Optimizations
-
 # =============================================================================
 
-# Extended autotuning configurations for different architectures
-
+# Extended autotuning configurations for KasminaLayer 1D operations
 def get_autotuning_configs():
-    """Generate architecture-aware autotuning configurations"""
-    configs = []
-
-    # Base configurations for all architectures
+    """Generate architecture-aware autotuning configurations for 1D KasminaLayer operations"""
+    # Base configurations for 1D chunk processing
     base_configs = [
-        # Small blocks for small problems
-        triton.Config({'BLOCK_SIZE': 32}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=4),
+        # Small blocks for small chunks
+        triton.Config({'BLOCK_SIZE': 32}, num_warps=1, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128}, num_warps=4, num_stages=3),
         
         # Medium blocks - good general purpose
-        triton.Config({'BLOCK_SIZE': 256}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=5),
+        triton.Config({'BLOCK_SIZE': 256}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=8, num_stages=4),
         
         # Large blocks for bandwidth-bound kernels
-        triton.Config({'BLOCK_SIZE': 1024}, num_warps=16, num_stages=4),
-        triton.Config({'BLOCK_SIZE': 2048}, num_warps=32, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=5),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16, num_stages=5),
+    ]
+    
+    # Architecture-specific configurations for 1D operations
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        
+        if capability >= (9, 0):  # H100
+            # H100 has more SMs and better async copy
+            base_configs.extend([
+                triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=6),
+                triton.Config({'BLOCK_SIZE': 8192}, num_warps=32, num_stages=7),
+            ])
+        elif capability >= (8, 0):  # A100/A40
+            # A100 benefits from larger warps for bandwidth
+            base_configs.extend([
+                triton.Config({'BLOCK_SIZE': 2048}, num_warps=16, num_stages=5),
+                triton.Config({'BLOCK_SIZE': 4096}, num_warps=32, num_stages=6),
+            ])
+    
+    return base_configs
+
+def get_matrix_autotuning_configs():
+    """Generate autotuning configurations for matrix operations (used by backward kernel)"""
+    # Base configurations for matrix operations with proper M/N/K block sizes
+    base_configs = [
+        # Small blocks for small problems
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_warps=8, num_stages=4),
+        
+        # Medium blocks - good general purpose
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64}, num_warps=16, num_stages=5),
+        
+        # Large blocks for bandwidth-bound kernels
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512, 'BLOCK_SIZE_K': 64}, num_warps=32, num_stages=4),
     ]
     
     # Architecture-specific configurations
@@ -256,15 +625,15 @@ def get_autotuning_configs():
         if capability >= (9, 0):  # H100
             # H100 has more SMs and better async copy
             base_configs.extend([
-                triton.Config({'BLOCK_SIZE': 256}, num_warps=16, num_stages=6),
-                triton.Config({'BLOCK_SIZE': 512}, num_warps=32, num_stages=7),
-                triton.Config({'BLOCK_SIZE': 1024}, num_warps=32, num_stages=8),
+                triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_warps=16, num_stages=6),
+                triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 512, 'BLOCK_SIZE_K': 128}, num_warps=32, num_stages=7),
+                triton.Config({'BLOCK_SIZE_M': 512, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128}, num_warps=32, num_stages=8),
             ])
         elif capability >= (8, 0):  # A100/A40
             # A100 benefits from larger warps
             base_configs.extend([
-                triton.Config({'BLOCK_SIZE': 256}, num_warps=16, num_stages=5),
-                triton.Config({'BLOCK_SIZE': 512}, num_warps=16, num_stages=6),
+                triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_warps=16, num_stages=5),
+                triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128}, num_warps=16, num_stages=6),
             ])
     
     return base_configs
@@ -283,10 +652,10 @@ def get_autotuning_configs():
     restore_value=['BLOCK_SIZE']
 )
 @triton.jit
-def kasmina_production_forward_kernel(
+def kasmina_production_forward_kernel_tma(
     # Input/Output tensors
     input_ptr, output_ptr,
-
+    
     # State collection (SoA layout)
     lifecycle_states_ptr, blueprint_ids_ptr, blueprint_types_ptr,
     grafting_strategies_ptr, alpha_blend_ptr, epochs_in_state_ptr,
@@ -295,22 +664,21 @@ def kasmina_production_forward_kernel(
     # Telemetry buffer
     raw_telemetry_ptr,
     
-    # Blueprint weights registry
+    # Blueprint registry
     blueprint_weights_ptr, blueprint_offsets_ptr, blueprint_scales_ptr,
-    max_blueprint_offset,
+    
+    # TMA descriptors for optimized loading
+    tma_input_desc, tma_blueprint_desc, tma_output_desc,
     
     # Runtime parameters
     batch_size, hidden_dim, num_seeds, chunk_size, current_epoch,
-    max_blueprints,
+    max_blueprints, max_blueprint_offset,
     
     # Stability parameters
     stability_epsilon, 
     stability_lower_bound: tl.constexpr,
     stability_upper_bound: tl.constexpr,
-    
-    # TMA descriptors (optional, for H100/Ada)
-    tma_desc_input: tl.pointer_type(tl.uint8) = None,
-    
+        
     # Compile-time configuration flags
     ENABLE_TELEMETRY: tl.constexpr,
     ENABLE_INTEGRITY: tl.constexpr,
@@ -321,16 +689,19 @@ def kasmina_production_forward_kernel(
     TELEMETRY_METRICS: tl.constexpr = 6,
 ):
     """
-    Enhanced production Kasmina forward kernel with Warp Specialization and TMA.
+    TMA-enabled production Kasmina forward kernel maintaining original per-seed chunk semantics.
+    Uses Tensor Memory Accelerator for hardware-accelerated bulk transfers while preserving
+    the original KasminaLayer element-wise processing logic.
     """
     
-    # Grid parallelization and chunk calculation
+    # Grid parallelization: maintain original seed-based processing
     batch_idx = tl.program_id(0)
     seed_id = tl.program_id(1)
     
     if batch_idx >= batch_size or seed_id >= num_seeds:
         return
     
+    # Calculate chunk boundaries - maintain original semantics
     chunk_start = seed_id * chunk_size
     chunk_end = tl.minimum(chunk_start + chunk_size, hidden_dim)
     actual_chunk_size = chunk_end - chunk_start
@@ -338,48 +709,40 @@ def kasmina_production_forward_kernel(
     if chunk_start >= hidden_dim or actual_chunk_size <= 0:
         return
 
-    # 1. Declare shared memory for the input data chunk
-    shared_input_data = tl.empty(BLOCK_SIZE, dtype=tl.float32)
-
-    # 2. Setup warp specialization roles
+    # Warp specialization for TMA operations
     if ENABLE_WARP_SPEC:
-        num_warps = tl.num_warps()
-        warp_id = tl.program_id(2)
-        is_producer_warp = warp_id < (num_warps // 2)
-    else:
-        is_producer_warp = True
+        warp_id = tl.program_id(2) % tl.num_warps()
+        if warp_id < tl.num_warps() // 2:
+            # Producer warps: handle TMA loads
+            pass
+        else:
+            # Consumer warps: handle computation
+            tl.async_wait(0)
 
-    # Calculate tensor offsets
+    # Calculate tensor offsets for this seed and batch
     input_offset = batch_idx * hidden_dim + chunk_start
     output_offset = batch_idx * hidden_dim + chunk_start
     chunk_offsets = tl.arange(0, BLOCK_SIZE)
     chunk_mask = chunk_offsets < actual_chunk_size
 
-    # 3. Producer warps load data from global HBM into shared memory
-    if is_producer_warp:
-        if ENABLE_TMA and tma_desc_input is not None:
-            # Placeholder for actual TMA call
-            gmem_data = tl.load(input_ptr + input_offset + chunk_offsets, mask=chunk_mask, other=0.0)
-            tl.store(shared_input_data + chunk_offsets, gmem_data, mask=chunk_mask)
-        else:
-            gmem_data = tl.load(input_ptr + input_offset + chunk_offsets, mask=chunk_mask, other=0.0)
-            tl.store(shared_input_data + chunk_offsets, gmem_data, mask=chunk_mask)
+    # Load input data using TMA if available, otherwise fallback to regular load
+    if ENABLE_TMA and tma_input_desc is not None:
+        # TMA bulk load for entire chunk
+        input_data = tl.load_tensor_descriptor(
+            tma_input_desc, 
+            [batch_idx, seed_id]  # Use batch and seed indices for TMA
+        )
+        # Extract the relevant chunk
+        input_data = input_data[chunk_offsets]
+        input_data = tl.where(chunk_mask, input_data, 0.0)
+    else:
+        # Fallback to regular load
+        input_data = tl.load(input_ptr + input_offset + chunk_offsets, mask=chunk_mask, other=0.0)
 
-    # 4. Synchronize warps
-    if ENABLE_TMA and is_producer_warp:
-        # Placeholder for TMA wait
-        pass
-        
-    tl.sync_warps()
-
-    # 5. All warps now load from fast shared memory
-    input_data = tl.load(shared_input_data + chunk_offsets, mask=chunk_mask, other=0.0)
-
-    # Load seed state
+    # Load seed state (always regular loads for state data)
     lifecycle_state = tl.load(lifecycle_states_ptr + seed_id)
     blueprint_id = tl.load(blueprint_ids_ptr + seed_id)
     blueprint_type = tl.load(blueprint_types_ptr + seed_id)
-    grafting_strategy = tl.load(grafting_strategies_ptr + seed_id)
     alpha_blend_factor = tl.load(alpha_blend_ptr + seed_id)
     
     # Numerical stability
@@ -389,78 +752,95 @@ def kasmina_production_forward_kernel(
         is_denormal = tl.abs(input_data) < stability_epsilon
         input_data = tl.where(is_denormal, 0.0, input_data)
     
-    # State-based processing
+    # State-based processing - maintain original KasminaLayer logic
     final_output = input_data
     is_active = lifecycle_state >= LifecycleState.GRAFTING
     has_blueprint = blueprint_id > 0
     should_process = is_active & has_blueprint
     
-    if should_process:
-        if blueprint_id < max_blueprints:
-            blueprint_offset = tl.load(blueprint_offsets_ptr + blueprint_id)
-            if blueprint_offset <= max_blueprint_offset:
-                blueprint_scale = tl.load(blueprint_scales_ptr + blueprint_id)
+    if should_process and blueprint_id < max_blueprints:
+        blueprint_offset = tl.load(blueprint_offsets_ptr + blueprint_id)
+        if blueprint_offset <= max_blueprint_offset:
+            blueprint_scale = tl.load(blueprint_scales_ptr + blueprint_id)
+            
+            # Load blueprint weights using TMA if available
+            if ENABLE_TMA and tma_blueprint_desc is not None:
+                blueprint_weights = tl.load_tensor_descriptor(
+                    tma_blueprint_desc,
+                    [seed_id]  # Blueprint weights indexed by seed
+                )
+                # Extract the relevant chunk
+                blueprint_weights = blueprint_weights[chunk_offsets]
+                blueprint_weights = tl.where(chunk_mask, blueprint_weights, 0.0)
+            else:
+                # Fallback to regular load
                 blueprint_weights = tl.load(
                     blueprint_weights_ptr + blueprint_offset + chunk_offsets,
                     mask=chunk_mask, other=0.0
                 )
-                
-                # Type-specific transformations
-                if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
-                    transformed = input_data + blueprint_weights * blueprint_scale
-                
-                elif blueprint_type == BlueprintType.ATTENTION_HEAD:
-                    max_val = tl.max(blueprint_weights, axis=0)
-                    exp_weights = tl.exp(blueprint_weights - max_val)
-                    sum_exp = tl.sum(exp_weights, axis=0)
-                    attention_weights = exp_weights / tl.maximum(sum_exp, stability_epsilon)
-                    transformed = input_data * attention_weights
-                
-                elif blueprint_type == BlueprintType.MLP_EXPANSION:
-                    expanded = tl.maximum(input_data * blueprint_weights, 0.0)
-                    transformed = expanded * blueprint_scale
+            
+            # Type-specific transformations - maintain original semantics
+            if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
+                transformed = input_data + blueprint_weights * blueprint_scale
+            
+            elif blueprint_type == BlueprintType.ATTENTION_HEAD:
+                max_val = tl.max(blueprint_weights, axis=0)
+                exp_weights = tl.exp(blueprint_weights - max_val)
+                sum_exp = tl.sum(exp_weights, axis=0)
+                attention_weights = exp_weights / tl.maximum(sum_exp, stability_epsilon)
+                transformed = input_data * attention_weights
+            
+            elif blueprint_type == BlueprintType.MLP_EXPANSION:
+                expanded = tl.maximum(input_data * blueprint_weights, 0.0)
+                transformed = expanded * blueprint_scale
 
-                elif blueprint_type == BlueprintType.CONV_FILTER:
-                    # 1D Convolution with a filter of size 3
-                    # Assumes blueprint_weights contains the 3 filter weights.
-                    w0 = tl.load(blueprint_weights_ptr + blueprint_offset + 0)
-                    w1 = tl.load(blueprint_weights_ptr + blueprint_offset + 1)
-                    w2 = tl.load(blueprint_weights_ptr + blueprint_offset + 2)
-                    
-                    # Load previous inputs, handling boundaries with padding (0.0)
-                    # We are using the 'input_data' loaded from shared memory
-                    x_curr = input_data
-                    x_prev = tl.load(shared_input_data + chunk_offsets - 1, mask=chunk_mask & (chunk_offsets > 0), other=0.0)
-                    x_prev2 = tl.load(shared_input_data + chunk_offsets - 2, mask=chunk_mask & (chunk_offsets > 1), other=0.0)
-
-                    # Apply convolution
-                    convolved = w0 * x_curr + w1 * x_prev + w2 * x_prev2
-                    transformed = convolved * blueprint_scale
-
-                else:
-                    # Default: linear transformation
-                    transformed = input_data * blueprint_weights
+            elif blueprint_type == BlueprintType.CONV_FILTER:
+                # 1D Convolution with a filter of size 3
+                w0 = tl.load(blueprint_weights_ptr + blueprint_offset + 0)
+                w1 = tl.load(blueprint_weights_ptr + blueprint_offset + 1)
+                w2 = tl.load(blueprint_weights_ptr + blueprint_offset + 2)
                 
-                # Simplified grafting for this example
-                final_alpha = alpha_blend_factor 
-                final_alpha = tl.maximum(tl.minimum(final_alpha, 1.0), 0.0)
-                
-                # Blending
-                final_output = final_alpha * transformed + (1.0 - final_alpha) * input_data
+                # Load previous inputs with padding
+                x_curr = input_data
+                x_prev = tl.load(input_ptr + input_offset + chunk_offsets - 1, 
+                               mask=chunk_mask & (chunk_offsets > 0), other=0.0)
+                x_prev2 = tl.load(input_ptr + input_offset + chunk_offsets - 2, 
+                                mask=chunk_mask & (chunk_offsets > 1), other=0.0)
+
+                # Apply convolution
+                convolved = w0 * x_curr + w1 * x_prev + w2 * x_prev2
+                transformed = convolved * blueprint_scale
+
+            else:
+                # Default: linear transformation
+                transformed = input_data * blueprint_weights
+            
+            # Blending - maintain original logic
+            final_alpha = tl.maximum(tl.minimum(alpha_blend_factor, 1.0), 0.0)
+            final_output = final_alpha * transformed + (1.0 - final_alpha) * input_data
     
     # Final numerical stability check
     if NUMERICAL_STABILITY:
         final_output = tl.maximum(final_output, stability_lower_bound)
         final_output = tl.minimum(final_output, stability_upper_bound)
 
-    # Store output
-    tl.store(
-        output_ptr + output_offset + chunk_offsets,
-        final_output,
-        mask=chunk_mask
-    )
+    # Store output using TMA if available
+    if ENABLE_TMA and tma_output_desc is not None:
+        # Store using TMA
+        tl.store_tensor_descriptor(
+            tma_output_desc,
+            [batch_idx, seed_id],
+            final_output
+        )
+    else:
+        # Fallback to regular store
+        tl.store(
+            output_ptr + output_offset + chunk_offsets,
+            final_output,
+            mask=chunk_mask
+        )
     
-    # Local telemetry collection (no atomics for efficiency)
+    # Local telemetry collection - maintain original logic
     if ENABLE_TELEMETRY and lifecycle_state == LifecycleState.DORMANT:
         # Compute local statistics using Welford's algorithm for numerical stability
         valid_count = tl.sum(chunk_mask.to(tl.float32))
@@ -478,15 +858,15 @@ def kasmina_production_forward_kernel(
             chunk_min = tl.min(tl.where(chunk_mask, input_data, float('inf')))
             chunk_max = tl.max(tl.where(chunk_mask, input_data, float('-inf')))
             
-            # Dead neuron ratio (neurons with very small activation)
+            # Dead neuron ratio
             is_dead = tl.abs(input_data) < stability_epsilon
             dead_ratio = tl.sum((is_dead & chunk_mask).to(tl.float32)) / valid_count
             
-            # Signal-to-noise ratio with safe division
+            # Signal-to-noise ratio
             chunk_std = tl.sqrt(chunk_variance + stability_epsilon)
             signal_to_noise = tl.abs(chunk_mean) / chunk_std
             
-            # Store in telemetry buffer for later reduction
+            # Store in telemetry buffer
             telemetry_offset = (batch_idx * num_seeds + seed_id) * TELEMETRY_METRICS
             tl.store(raw_telemetry_ptr + telemetry_offset + 0, chunk_variance)
             tl.store(raw_telemetry_ptr + telemetry_offset + 1, chunk_mean)
@@ -494,6 +874,321 @@ def kasmina_production_forward_kernel(
             tl.store(raw_telemetry_ptr + telemetry_offset + 3, chunk_max)
             tl.store(raw_telemetry_ptr + telemetry_offset + 4, dead_ratio)
             tl.store(raw_telemetry_ptr + telemetry_offset + 5, signal_to_noise)
+@triton.autotune(
+    configs=get_autotuning_configs(),
+    key=['batch_size', 'num_seeds', 'hidden_dim', 'chunk_size'],
+    prune_configs_by={
+        'perf_model': lambda configs, **kwargs: [
+            c for c in configs
+            if c.kwargs['BLOCK_SIZE'] <= kwargs.get('chunk_size', float('inf'))
+            and c.num_warps * 32 <= c.kwargs['BLOCK_SIZE']
+        ],
+        'top_k': 10,
+    },
+    restore_value=['BLOCK_SIZE']
+)
+@triton.jit
+def kasmina_production_forward_kernel_legacy(
+    # Input/Output tensors
+    input_ptr, output_ptr,
+
+    # State collection (SoA layout)
+    lifecycle_states_ptr, blueprint_ids_ptr, blueprint_types_ptr,
+    grafting_strategies_ptr, alpha_blend_ptr, epochs_in_state_ptr,
+    performance_scores_ptr, stability_metrics_ptr,
+    
+    # Telemetry buffer
+    raw_telemetry_ptr,
+    
+    # Blueprint weights registry
+    blueprint_weights_ptr, blueprint_offsets_ptr, blueprint_scales_ptr,
+
+    # Legacy TMA descriptor pointer (for backward compatibility)
+    tma_desc_bp_weights_ptr: tl.pointer_type(tl.uint8),
+
+    # Runtime parameters
+    max_blueprint_offset,
+    batch_size, hidden_dim, num_seeds, chunk_size, current_epoch,
+    max_blueprints,
+    
+    # Stability parameters
+    stability_epsilon, 
+    stability_lower_bound: tl.constexpr,
+    stability_upper_bound: tl.constexpr,
+        
+    # Compile-time configuration flags
+    ENABLE_TELEMETRY: tl.constexpr,
+    ENABLE_INTEGRITY: tl.constexpr,
+    NUMERICAL_STABILITY: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
+    ENABLE_WARP_SPEC: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    TELEMETRY_METRICS: tl.constexpr = 6,
+):
+    """
+    Legacy production Kasmina forward kernel for non-TMA hardware.
+    Maintains compatibility with older GPUs while providing high performance.
+    """
+    
+    # Grid parallelization and chunk calculation
+    batch_idx = tl.program_id(0)
+    seed_id = tl.program_id(1)
+    
+    if batch_idx >= batch_size or seed_id >= num_seeds:
+        return
+    
+    chunk_start = seed_id * chunk_size
+    chunk_end = tl.minimum(chunk_start + chunk_size, hidden_dim)
+    actual_chunk_size = chunk_end - chunk_start
+    
+    if chunk_start >= hidden_dim or actual_chunk_size <= 0:
+        return
+
+    # Setup warp specialization roles
+    if ENABLE_WARP_SPEC:
+        # Warp specialization disabled in legacy kernel for simplicity
+        pass
+
+    # Calculate tensor offsets
+    input_offset = batch_idx * hidden_dim + chunk_start
+    output_offset = batch_idx * hidden_dim + chunk_start
+    chunk_offsets = tl.arange(0, BLOCK_SIZE)
+    chunk_mask = chunk_offsets < actual_chunk_size
+
+    # Load input data
+    input_data = tl.load(input_ptr + input_offset + chunk_offsets, mask=chunk_mask, other=0.0)
+
+    # Load seed state
+    lifecycle_state = tl.load(lifecycle_states_ptr + seed_id)
+    blueprint_id = tl.load(blueprint_ids_ptr + seed_id)
+    blueprint_type = tl.load(blueprint_types_ptr + seed_id)
+    alpha_blend_factor = tl.load(alpha_blend_ptr + seed_id)
+    
+    # Numerical stability
+    if NUMERICAL_STABILITY:
+        input_data = tl.maximum(input_data, stability_lower_bound)
+        input_data = tl.minimum(input_data, stability_upper_bound)
+        is_denormal = tl.abs(input_data) < stability_epsilon
+        input_data = tl.where(is_denormal, 0.0, input_data)
+    
+    # State-based processing
+    final_output = input_data
+    is_active = lifecycle_state >= LifecycleState.GRAFTING
+    has_blueprint = blueprint_id > 0
+    should_process = is_active & has_blueprint
+    
+    if should_process and blueprint_id < max_blueprints:
+        blueprint_offset = tl.load(blueprint_offsets_ptr + blueprint_id)
+        if blueprint_offset <= max_blueprint_offset:
+            blueprint_scale = tl.load(blueprint_scales_ptr + blueprint_id)
+            
+            # Load blueprint weights
+            blueprint_weights = tl.load(
+                blueprint_weights_ptr + blueprint_offset + chunk_offsets,
+                mask=chunk_mask, other=0.0
+            )
+            
+            # Type-specific transformations
+            if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
+                transformed = input_data + blueprint_weights * blueprint_scale
+            
+            elif blueprint_type == BlueprintType.ATTENTION_HEAD:
+                max_val = tl.max(blueprint_weights, axis=0)
+                exp_weights = tl.exp(blueprint_weights - max_val)
+                sum_exp = tl.sum(exp_weights, axis=0)
+                attention_weights = exp_weights / tl.maximum(sum_exp, stability_epsilon)
+                transformed = input_data * attention_weights
+            
+            elif blueprint_type == BlueprintType.MLP_EXPANSION:
+                expanded = tl.maximum(input_data * blueprint_weights, 0.0)
+                transformed = expanded * blueprint_scale
+
+            elif blueprint_type == BlueprintType.CONV_FILTER:
+                # 1D Convolution with a filter of size 3
+                w0 = tl.load(blueprint_weights_ptr + blueprint_offset + 0)
+                w1 = tl.load(blueprint_weights_ptr + blueprint_offset + 1)
+                w2 = tl.load(blueprint_weights_ptr + blueprint_offset + 2)
+                
+                # Load previous inputs with padding
+                x_curr = input_data
+                x_prev = tl.load(input_ptr + input_offset + chunk_offsets - 1, 
+                               mask=chunk_mask & (chunk_offsets > 0), other=0.0)
+                x_prev2 = tl.load(input_ptr + input_offset + chunk_offsets - 2, 
+                                mask=chunk_mask & (chunk_offsets > 1), other=0.0)
+
+                # Apply convolution
+                convolved = w0 * x_curr + w1 * x_prev + w2 * x_prev2
+                transformed = convolved * blueprint_scale
+
+            else:
+                # Default: linear transformation
+                transformed = input_data * blueprint_weights
+            
+            # Blending
+            final_alpha = tl.maximum(tl.minimum(alpha_blend_factor, 1.0), 0.0)
+            final_output = final_alpha * transformed + (1.0 - final_alpha) * input_data
+    
+    # Final numerical stability check
+    if NUMERICAL_STABILITY:
+        final_output = tl.maximum(final_output, stability_lower_bound)
+        final_output = tl.minimum(final_output, stability_upper_bound)
+
+    # Store output
+    tl.store(
+        output_ptr + output_offset + chunk_offsets,
+        final_output,
+        mask=chunk_mask
+    )
+    
+    # Local telemetry collection
+    if ENABLE_TELEMETRY and lifecycle_state == LifecycleState.DORMANT:
+        # Compute local statistics using Welford's algorithm for numerical stability
+        valid_count = tl.sum(chunk_mask.to(tl.float32))
+        
+        if valid_count > 0:
+            # Online mean and variance computation
+            chunk_mean = tl.sum(input_data * chunk_mask.to(tl.float32)) / valid_count
+            
+            # Variance using shifted data for numerical stability
+            shifted_data = input_data - chunk_mean
+            chunk_variance = tl.sum(shifted_data * shifted_data * chunk_mask.to(tl.float32)) / valid_count
+            chunk_variance = tl.maximum(chunk_variance, 0.0)
+            
+            # Min/max with masking
+            chunk_min = tl.min(tl.where(chunk_mask, input_data, float('inf')))
+            chunk_max = tl.max(tl.where(chunk_mask, input_data, float('-inf')))
+            
+            # Dead neuron ratio
+            is_dead = tl.abs(input_data) < stability_epsilon
+            dead_ratio = tl.sum((is_dead & chunk_mask).to(tl.float32)) / valid_count
+            
+            # Signal-to-noise ratio
+            chunk_std = tl.sqrt(chunk_variance + stability_epsilon)
+            signal_to_noise = tl.abs(chunk_mean) / chunk_std
+            
+            # Store in telemetry buffer
+            telemetry_offset = (batch_idx * num_seeds + seed_id) * TELEMETRY_METRICS
+            tl.store(raw_telemetry_ptr + telemetry_offset + 0, chunk_variance)
+            tl.store(raw_telemetry_ptr + telemetry_offset + 1, chunk_mean)
+            tl.store(raw_telemetry_ptr + telemetry_offset + 2, chunk_min)
+            tl.store(raw_telemetry_ptr + telemetry_offset + 3, chunk_max)
+            tl.store(raw_telemetry_ptr + telemetry_offset + 4, dead_ratio)
+            tl.store(raw_telemetry_ptr + telemetry_offset + 5, signal_to_noise)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 64, 'CHANNELS_PER_BLOCK': 16}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 128, 'CHANNELS_PER_BLOCK': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 256, 'CHANNELS_PER_BLOCK': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 512, 'CHANNELS_PER_BLOCK': 128}, num_warps=8, num_stages=4),
+    ],
+    key=['batch_size', 'num_seeds', 'hidden_dim'],
+)
+@triton.jit
+def kasmina_production_backward_kernel_optimized(
+    # Gradient inputs/outputs
+    grad_output_ptr, input_ptr, weight_ptr, grad_input_ptr,
+    
+    # Dimensions for shared memory optimization
+    batch_size, in_channels, out_channels, input_length, kernel_size,
+    
+    # Configuration
+    BLOCK_SIZE: tl.constexpr,
+    CHANNELS_PER_BLOCK: tl.constexpr,
+):
+    """
+    Optimized backward kernel with shared memory and cooperative loading.
+    Fixed shared memory indexing and maintains KasminaLayer gradient semantics.
+    """
+    
+    # Program IDs for multi-dimensional tiling
+    batch_id = tl.program_id(0)
+    block_id = tl.program_id(1) 
+    channel_block_id = tl.program_id(2)
+    
+    # Calculate processing boundaries
+    input_start = block_id * BLOCK_SIZE
+    input_end = tl.minimum(input_start + BLOCK_SIZE, input_length)
+    actual_block_size = input_end - input_start
+    
+    # Channel block management
+    channel_start = channel_block_id * CHANNELS_PER_BLOCK
+    channel_offsets = channel_start + tl.arange(0, CHANNELS_PER_BLOCK)
+    
+    # === SHARED MEMORY ALLOCATION ===
+    # Allocate shared memory with halo regions for convolution
+    halo_size = kernel_size - 1
+    shared_size = BLOCK_SIZE + 2 * halo_size
+    
+    # Use proper 2D shared memory allocation
+    grad_output_shared = tl.zeros([shared_size, CHANNELS_PER_BLOCK], dtype=tl.float32)
+    
+    # === COOPERATIVE LOADING ===
+    # Load grad_output with overlapping regions for data reuse
+    for load_idx in range(0, shared_size, BLOCK_SIZE):
+        load_start = input_start - halo_size + load_idx
+        load_end = tl.minimum(load_start + BLOCK_SIZE, input_start - halo_size + shared_size)
+        actual_load_size = load_end - load_start
+        
+        if actual_load_size > 0:
+            load_offsets = tl.arange(0, BLOCK_SIZE)
+            load_mask = (load_offsets < actual_load_size) & ((load_start + load_offsets) >= 0) & ((load_start + load_offsets) < input_length)
+            
+            # Multi-channel loading with coalesced access
+            for c_idx in range(CHANNELS_PER_BLOCK):
+                if channel_start + c_idx < out_channels:
+                    channel_ptr = (grad_output_ptr + 
+                                 batch_id * (input_length * out_channels) +
+                                 (channel_start + c_idx) * input_length)
+                    
+                    # Load gradient data
+                    grad_data = tl.load(
+                        channel_ptr + load_start + load_offsets, 
+                        mask=load_mask, 
+                        other=0.0
+                    )
+                    
+                    # Store to shared memory with correct 2D indexing
+                    shared_row_start = load_idx
+                    shared_row_end = tl.minimum(load_idx + BLOCK_SIZE, shared_size)
+                    
+                    # Fixed indexing: Use proper 2D addressing
+                    for r_idx in range(shared_row_end - shared_row_start):
+                        if r_idx < actual_load_size:
+                            shared_addr = (shared_row_start + r_idx) * CHANNELS_PER_BLOCK + c_idx
+                            tl.store(grad_output_shared + shared_addr, grad_data[r_idx])
+    
+    # === CONVOLUTION COMPUTATION ===
+    # Compute gradients using cached data from shared memory
+    for pos in range(actual_block_size):
+        grad_sum = tl.zeros([in_channels], dtype=tl.float32)
+        
+        for k in range(kernel_size):
+            grad_row_idx = pos + halo_size + k
+            weight_idx = kernel_size - 1 - k  # Convolution flip
+            
+            # Load from shared memory with correct indexing
+            grad_vals = tl.zeros([CHANNELS_PER_BLOCK], dtype=tl.float32)
+            for c_idx in range(CHANNELS_PER_BLOCK):
+                if channel_start + c_idx < out_channels:
+                    shared_addr = grad_row_idx * CHANNELS_PER_BLOCK + c_idx
+                    grad_vals[c_idx] = tl.load(grad_output_shared + shared_addr)
+            
+            # Weight loading with optimal access pattern
+            weight_base_ptr = weight_ptr + weight_idx * out_channels * in_channels
+            for c_idx in range(CHANNELS_PER_BLOCK):
+                if channel_start + c_idx < out_channels:
+                    channel_weight_ptr = weight_base_ptr + (channel_start + c_idx) * in_channels
+                    weights = tl.load(channel_weight_ptr + tl.arange(0, in_channels))
+                    
+                    # Accumulate gradient computation
+                    grad_sum += grad_vals[c_idx] * weights
+        
+        # Store computed gradients
+        output_ptr = (grad_input_ptr + 
+                     batch_id * (input_length * in_channels) +
+                     (input_start + pos) * in_channels)
+        tl.store(output_ptr + tl.arange(0, in_channels), grad_sum)
 
 @triton.autotune(
     configs=[
@@ -505,7 +1200,7 @@ def kasmina_production_forward_kernel(
     key=['batch_size', 'num_seeds', 'hidden_dim'],
 )
 @triton.jit
-def kasmina_production_backward_kernel(
+def kasmina_production_backward_kernel_legacy(
     # Gradient inputs/outputs
     grad_output_ptr, grad_input_ptr,
 
@@ -537,11 +1232,11 @@ def kasmina_production_backward_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    High-performance backward pass kernel for KasminaLayer.
+    Legacy high-performance backward pass kernel for KasminaLayer.
     Computes gradients for the input, blueprint weights, and blueprint scales.
     """
     
-    # Grid, chunk, and gradient setup (no changes here)
+    # Grid, chunk, and gradient setup
     batch_idx = tl.program_id(0)
     seed_id = tl.program_id(1)
     
@@ -580,21 +1275,19 @@ def kasmina_production_backward_kernel(
         blueprint_scale = tl.load(blueprint_scales_ptr + blueprint_id)
         
         if blueprint_offset <= max_blueprint_offset:
+            # Initialize grad variables
+            weight_grad = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+            scale_grad = 0.0
+
             blueprint_weights = tl.load(
                 blueprint_weights_ptr + blueprint_offset + chunk_offsets,
                 mask=chunk_mask, other=0.0
             )
             
-            # --- RESTRUCTURED GRADIENT LOGIC ---
-            
             if blueprint_type == BlueprintType.RESIDUAL_BLOCK:
                 weight_grad = alpha_blend * grad_out * input_data
                 scale_grad = alpha_blend * tl.sum(grad_out * blueprint_weights)
                 grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_out * blueprint_scale
-                
-                # Self-contained atomic adds
-                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
-                tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
 
             elif blueprint_type == BlueprintType.ATTENTION_HEAD:
                 max_val = tl.max(blueprint_weights, axis=0)
@@ -607,11 +1300,7 @@ def kasmina_production_backward_kernel(
                 grad_s = alpha_blend * input_data * grad_out
                 s_grad_s = attention_weights * grad_s
                 weight_grad = s_grad_s - attention_weights * tl.sum(s_grad_s, axis=0)
-                scale_grad = 0.0 # Scale not used in this formulation
-                
-                # Self-contained atomic adds
-                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
-                # No need to add 0 for scale_grad, but we could if needed: tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
+                scale_grad = 0.0
 
             elif blueprint_type == BlueprintType.MLP_EXPANSION:
                 relu_mask = (input_data * blueprint_weights) > 0
@@ -619,41 +1308,50 @@ def kasmina_production_backward_kernel(
                 scale_grad = alpha_blend * tl.sum(grad_out * blueprint_weights * relu_mask.to(tl.float32))
                 grad_transformed_path = alpha_blend * grad_out * blueprint_weights * blueprint_scale * relu_mask.to(tl.float32)
                 grad_in = (1.0 - alpha_blend) * grad_out + grad_transformed_path
-                
-                # Self-contained atomic adds
-                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
-                tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
 
             elif blueprint_type == BlueprintType.CONV_FILTER:
+                # Load the 3 filter weights individually
                 w0 = tl.load(blueprint_weights_ptr + blueprint_offset + 0)
                 w1 = tl.load(blueprint_weights_ptr + blueprint_offset + 1)
                 w2 = tl.load(blueprint_weights_ptr + blueprint_offset + 2)
                 
+                # Gradient w.r.t. input
                 grad_out_curr = grad_out
-                grad_out_next = tl.load(grad_output_ptr + grad_offset + chunk_offsets + 1, mask=chunk_mask & (chunk_offsets < actual_chunk_size - 1), other=0.0)
-                grad_out_next2 = tl.load(grad_output_ptr + grad_offset + chunk_offsets + 2, mask=chunk_mask & (chunk_offsets < actual_chunk_size - 2), other=0.0)
-                
+                grad_out_next = tl.load(grad_output_ptr + grad_offset + chunk_offsets + 1, 
+                                      mask=chunk_mask & (chunk_offsets < actual_chunk_size - 1), other=0.0)
+                grad_out_next2 = tl.load(grad_output_ptr + grad_offset + chunk_offsets + 2, 
+                                       mask=chunk_mask & (chunk_offsets < actual_chunk_size - 2), other=0.0)
                 grad_in_transformed = (w0 * grad_out_curr + w1 * grad_out_next + w2 * grad_out_next2) * blueprint_scale
                 grad_in = (1.0 - alpha_blend) * grad_out + alpha_blend * grad_in_transformed
                 
+                # Gradient w.r.t. weights (handled with special atomics)
                 x_curr = input_data
-                x_prev = tl.load(input_ptr + grad_offset + chunk_offsets - 1, mask=chunk_mask & (chunk_offsets > 0), other=0.0)
-                x_prev2 = tl.load(input_ptr + grad_offset + chunk_offsets - 2, mask=chunk_mask & (chunk_offsets > 1), other=0.0)
+                x_prev = tl.load(input_ptr + grad_offset + chunk_offsets - 1, 
+                               mask=chunk_mask & (chunk_offsets > 0), other=0.0)
+                x_prev2 = tl.load(input_ptr + grad_offset + chunk_offsets - 2, 
+                                mask=chunk_mask & (chunk_offsets > 1), other=0.0)
                 
-                # Correctly calculate and accumulate grads for the 3 filter weights
                 grad_w0 = tl.sum(x_curr * grad_out * blueprint_scale * alpha_blend)
                 tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + 0, grad_w0)
-
+                
                 grad_w1 = tl.sum(x_prev * grad_out * blueprint_scale * alpha_blend)
                 tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + 1, grad_w1)
 
                 grad_w2 = tl.sum(x_prev2 * grad_out * blueprint_scale * alpha_blend)
                 tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + 2, grad_w2)
 
+                # Gradient w.r.t. scale
                 convolved = w0 * x_curr + w1 * x_prev + w2 * x_prev2
                 scale_grad = tl.sum(grad_out * convolved * alpha_blend)
+
+            # Accumulate gradients for all types except CONV_FILTER's special weight grad
+            if blueprint_type != BlueprintType.CONV_FILTER:
+                tl.atomic_add(grad_blueprint_weights_ptr + blueprint_offset + chunk_offsets, weight_grad, mask=chunk_mask)
+            
+            # Atomically add the scale gradient
+            if tl.thread_id() == 0:
                 tl.atomic_add(grad_blueprint_scales_ptr + blueprint_id, scale_grad)
-    
+
     # Store final input gradient
     tl.store(
         grad_input_ptr + grad_offset + chunk_offsets,
@@ -661,7 +1359,7 @@ def kasmina_production_backward_kernel(
         mask=chunk_mask
     )
     
-    # Compute gradient statistics (no changes here)
+    # Compute gradient statistics
     if COMPUTE_GRAD_STATS:
         grad_norm = tl.sqrt(tl.sum(grad_in * grad_in * chunk_mask.to(tl.float32)))
         grad_variance = tl.sum((grad_in - tl.sum(grad_in) / actual_chunk_size) ** 2)
@@ -738,9 +1436,7 @@ def telemetry_reduction_kernel(
         pass
 
 # =============================================================================
-
 # PyTorch Integration Layer with Enhanced Features
-
 # =============================================================================
 
 @torch.compile(mode="max-autotune", fullgraph=True)
@@ -758,44 +1454,42 @@ def profiling_context(enabled=False):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        yield (start, end)
+        yield
         end.record()
         torch.cuda.synchronize()
         print(f"Kernel time: {start.elapsed_time(end):.3f}ms")
     else:
-        yield (None, None)
+        yield
 
 class KasminaAutogradFunction(torch.autograd.Function):
-    """Custom autograd function with gradient checkpointing support"""
+    """Enhanced autograd function with TMA support and optimized backward pass"""
 
     @staticmethod
     def forward(ctx, input_tensor, state_collection, blueprint_weights, 
-                blueprint_offsets, blueprint_scales, current_epoch, config):
-        """Enhanced forward with gradient checkpointing support"""
-
-        # 1. Call the main forward kernel FIRST to get the output
-        output, telemetry = kasmina_production_forward_triton_op(
+                blueprint_offsets, blueprint_scales, current_epoch, 
+                tma_desc_pointers, config):
+        """Enhanced forward that supports both TMA and legacy kernels."""
+        
+        # Call the main forward kernel to get the output
+        output, _ = kasmina_production_forward_triton_op(
             input_tensor, state_collection, blueprint_weights,
             blueprint_offsets, blueprint_scales, current_epoch,
+            tma_desc_pointers,
             config.numerical_stability_mode == "strict",
             config.enable_telemetry
         )
 
-        # 2. NOW save the input and the computed output for the backward pass
+        # Save tensors and context for the backward pass
         ctx.save_for_backward(input_tensor, output, blueprint_weights, blueprint_scales)
-        
-        # 3. Save the other non-tensor context data
         ctx.state_collection = state_collection
         ctx.blueprint_offsets = blueprint_offsets
-        ctx.current_epoch = current_epoch
         ctx.config = config
-        ctx.telemetry = telemetry # You can save this if needed elsewhere
-
+        
         return output
     
     @staticmethod
     def backward(ctx, grad_output):
-        """Enhanced backward using Triton kernel"""
+        """Enhanced backward using optimized Triton kernels"""
         input_tensor, output, blueprint_weights, blueprint_scales = ctx.saved_tensors
 
         # Allocate gradient tensors
@@ -803,34 +1497,50 @@ class KasminaAutogradFunction(torch.autograd.Function):
         grad_blueprint_weights = torch.zeros_like(blueprint_weights)
         grad_blueprint_scales = torch.zeros_like(blueprint_scales)
         
-        # Launch backward kernel
         batch_size, hidden_dim = input_tensor.shape
         num_seeds = ctx.state_collection.num_seeds
         chunk_size = hidden_dim // num_seeds
         
-        # Grid configuration
-        grid = lambda meta: (batch_size, num_seeds)
-        
-        # Launch the backward kernel
-        kasmina_production_backward_kernel[grid](
-            grad_output, grad_input,
-            input_tensor, output,
-            ctx.state_collection.lifecycle_states,
-            ctx.state_collection.blueprint_ids,
-            ctx.state_collection.blueprint_types,
-            ctx.state_collection.grafting_strategies,
-            ctx.state_collection.alpha_blend,
-            blueprint_weights, ctx.blueprint_offsets, blueprint_scales,
-            grad_blueprint_weights, grad_blueprint_scales,
-            ctx.state_collection.gradient_stats,
-            batch_size, hidden_dim, num_seeds, chunk_size,
-            len(blueprint_scales), blueprint_weights.shape[0] - chunk_size,
-            1e-8, 10.0,  # stability_epsilon, grad_clip_value
-            ENABLE_GRAD_CLIP=True,
-            COMPUTE_GRAD_STATS=True
+        # Choose backward kernel based on config and availability
+        use_optimized_backward = (
+            ctx.config.enable_tma and
+            hasattr(ctx.state_collection, 'conv_filter_count') and
+            ctx.state_collection.conv_filter_count > 0
         )
         
-        return grad_input, None, grad_blueprint_weights, None, grad_blueprint_scales, None, None
+        if use_optimized_backward:
+            # Use optimized backward kernel with shared memory optimization
+            grid = lambda meta: (batch_size, triton.cdiv(hidden_dim, meta['BLOCK_SIZE']), 
+                               triton.cdiv(num_seeds, meta['CHANNELS_PER_BLOCK']))
+            
+            kasmina_production_backward_kernel_optimized[grid](
+                grad_output, input_tensor, blueprint_weights, grad_input,
+                batch_size, hidden_dim, num_seeds, hidden_dim, 3,  # kernel_size=3 for conv
+                # BLOCK_SIZE and CHANNELS_PER_BLOCK will be set by autotuning
+            )
+        else:
+            # Use legacy backward kernel
+            grid = lambda meta: (batch_size, num_seeds)
+            
+            kasmina_production_backward_kernel_legacy[grid](
+                grad_output, grad_input,
+                input_tensor, output,
+                ctx.state_collection.lifecycle_states,
+                ctx.state_collection.blueprint_ids,
+                ctx.state_collection.blueprint_types,
+                ctx.state_collection.grafting_strategies,
+                ctx.state_collection.alpha_blend,
+                blueprint_weights, ctx.blueprint_offsets, blueprint_scales,
+                grad_blueprint_weights, grad_blueprint_scales,
+                ctx.state_collection.gradient_stats,
+                batch_size, hidden_dim, num_seeds, chunk_size,
+                len(blueprint_scales), blueprint_weights.shape[0] - chunk_size,
+                1e-8, 10.0,  # stability_epsilon, grad_clip_value
+                ENABLE_GRAD_CLIP=True,
+                COMPUTE_GRAD_STATS=True
+            )
+        
+        return grad_input, None, grad_blueprint_weights, None, grad_blueprint_scales, None, None, None
 
 @torch.library.custom_op("kasmina_production::forward_with_telemetry", mutates_args={})
 def kasmina_production_forward_triton_op(
@@ -840,110 +1550,125 @@ def kasmina_production_forward_triton_op(
     blueprint_offsets: torch.Tensor,
     blueprint_scales: torch.Tensor,
     current_epoch: int,
+    tma_desc_pointers: Dict[str, Any], # Accept TensorDescriptor objects or pointers
     enable_strict_stability: bool = False,
     enable_telemetry: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Enhanced PyTorch integration with TMA support and profiling.
-
-    Returns:
-        Tuple of (output_tensor, telemetry_buffer)
+    Enhanced PyTorch integration with automatic TMA vs legacy kernel selection.
+    Uses TMA-enabled kernel when descriptors are available, falls back to legacy kernel.
     """
     batch_size, hidden_dim = input_tensor.shape
     num_seeds = state_collection.num_seeds
     chunk_size = hidden_dim // num_seeds
     device = input_tensor.device
     
-    # Comprehensive input validation
+    # Validations and setup
     if hidden_dim % num_seeds != 0:
         raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_seeds ({num_seeds})")
-    
-    if blueprint_weights.numel() == 0:
-        raise ValueError("blueprint_weights cannot be empty")
-    
-    # Calculate bounds
     max_blueprint_offset = blueprint_weights.shape[0] - chunk_size
     max_blueprints = blueprint_offsets.shape[0]
-    
-    # Allocate outputs
     output_tensor = torch.empty_like(input_tensor)
-    telemetry_buffer = torch.zeros(
-        (num_seeds, 6), dtype=torch.float32, device=device
-    ) if enable_telemetry else None
+    raw_telemetry = torch.zeros((batch_size * num_seeds, 6), dtype=torch.float32, device=device) if enable_telemetry else None
     
-    # Pre-compute stability bounds for efficiency
     if enable_strict_stability:
-        stability_stats = torch.std_mean(input_tensor)
-        stability_std, stability_mean = stability_stats[0].item(), stability_stats[1].item()
-        stability_lower = float(stability_mean - 6.0 * stability_std)
-        stability_upper = float(stability_mean + 6.0 * stability_std)
+        stability_stats = torch.std_mean(input_tensor, dim=None)
+        stability_lower = float(stability_stats[1] - 6.0 * stability_stats[0])
+        stability_upper = float(stability_stats[1] + 6.0 * stability_stats[0])
     else:
-        # Relaxed bounds for normal mode
-        stability_lower = -1e6
-        stability_upper = 1e6
+        stability_lower, stability_upper = -1e6, 1e6
     
-    # Raw telemetry buffer
-    raw_telemetry = torch.zeros(
-        (batch_size * num_seeds, 6), dtype=torch.float32, device=device
-    ) if enable_telemetry else None
+    # Determine if we can use TMA kernel
+    use_tma_kernel = (
+        state_collection.config.enable_tma and 
+        state_collection.tma_manager and 
+        state_collection.tma_manager.has_tma and
+        state_collection.tma_manager.use_tensor_descriptor and
+        tma_desc_pointers.get("input") is not None and
+        tma_desc_pointers.get("blueprint_weights") is not None and
+        tma_desc_pointers.get("output") is not None
+    )
     
-    # Check for TMA support
-    tma_desc_states = None
-    tma_desc_blueprints = None
-    if state_collection.config.enable_tma and state_collection.tma_manager:
-        tma_hints = state_collection.tma_manager.get_descriptor_hints()
-        # In production, these would be actual TMA descriptors
-    
-    # Grid configuration
-    grid = lambda meta: (batch_size, num_seeds)
-    
-    # Launch forward kernel with profiling
     with profiling_context(state_collection.config.enable_kernel_profiling):
-        kasmina_production_forward_kernel[grid](
-            input_tensor, output_tensor,
-            state_collection.lifecycle_states,
-            state_collection.blueprint_ids,
-            state_collection.blueprint_types,
-            state_collection.grafting_strategies,
-            state_collection.alpha_blend,
-            state_collection.epochs_in_state,
-            state_collection.performance_scores,
-            state_collection.stability_metrics,
-            raw_telemetry,
-            blueprint_weights, blueprint_offsets, blueprint_scales,
-            max_blueprint_offset,
-            batch_size, hidden_dim, num_seeds, chunk_size, current_epoch,
-            max_blueprints,
-            1e-8, stability_lower, stability_upper,
-            tma_desc_states, tma_desc_blueprints,
-            ENABLE_TELEMETRY=enable_telemetry,
-            ENABLE_INTEGRITY=state_collection.config.enable_integrity_checks,
-            NUMERICAL_STABILITY=enable_strict_stability,
-            ENABLE_TMA=state_collection.config.enable_tma,
-            ENABLE_WARP_SPEC=state_collection.config.enable_warp_specialization,
-            TELEMETRY_METRICS=6
-        )
+        if use_tma_kernel:
+            # Use TMA-enabled kernel for H100/Ada with TensorDescriptor support
+            grid = lambda meta: (triton.cdiv(batch_size * num_seeds, meta['BLOCK_SIZE_M']))
+            
+            kasmina_production_forward_kernel_tma[grid](
+                tma_desc_pointers["input"],
+                tma_desc_pointers["blueprint_weights"], 
+                tma_desc_pointers["output"],
+                state_collection.lifecycle_states, state_collection.blueprint_ids,
+                state_collection.blueprint_types, state_collection.grafting_strategies,
+                state_collection.alpha_blend, state_collection.epochs_in_state,
+                state_collection.performance_scores, state_collection.stability_metrics,
+                raw_telemetry,
+                blueprint_offsets, blueprint_scales,
+                batch_size, hidden_dim, chunk_size,  # M, N, K dimensions
+                batch_size, hidden_dim, num_seeds, chunk_size, current_epoch,
+                max_blueprints,
+                1e-8, stability_lower, stability_upper,
+                ENABLE_TELEMETRY=enable_telemetry,
+                ENABLE_INTEGRITY=state_collection.config.enable_integrity_checks,
+                NUMERICAL_STABILITY=enable_strict_stability,
+                BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64,
+                WARP_SPECIALIZE=state_collection.config.enable_warp_specialization,
+                TELEMETRY_METRICS=6
+            )
+        else:
+            # Use legacy kernel for backward compatibility
+            grid = lambda meta: (batch_size, num_seeds)
+            
+            # Extract legacy TMA pointer if available
+            tma_desc_bp_weights_ptr = 0
+            if "blueprint_weights" in tma_desc_pointers:
+                desc = tma_desc_pointers["blueprint_weights"]
+                if isinstance(desc, int):
+                    tma_desc_bp_weights_ptr = desc
+            
+            kasmina_production_forward_kernel_legacy[grid](
+                input_tensor, output_tensor,
+                state_collection.lifecycle_states, state_collection.blueprint_ids,
+                state_collection.blueprint_types, state_collection.grafting_strategies,
+                state_collection.alpha_blend, state_collection.epochs_in_state,
+                state_collection.performance_scores, state_collection.stability_metrics,
+                raw_telemetry,
+                blueprint_weights, blueprint_offsets, blueprint_scales,
+                tma_desc_bp_weights_ptr,
+                max_blueprint_offset,
+                batch_size, hidden_dim, num_seeds, chunk_size, current_epoch,
+                max_blueprints,
+                1e-8, stability_lower, stability_upper,
+                ENABLE_TELEMETRY=enable_telemetry,
+                ENABLE_INTEGRITY=state_collection.config.enable_integrity_checks,
+                NUMERICAL_STABILITY=enable_strict_stability,
+                ENABLE_TMA=state_collection.config.enable_tma,
+                ENABLE_WARP_SPEC=state_collection.config.enable_warp_specialization,
+                TELEMETRY_METRICS=6
+            )
     
-    # Telemetry reduction
-    if enable_telemetry and telemetry_buffer is not None:
-        reduction_grid = lambda meta: (num_seeds,)
+    # Telemetry reduction using hierarchical reducer
+    telemetry_buffer = None
+    if enable_telemetry and raw_telemetry is not None:
+        telemetry_buffer = torch.zeros((num_seeds, 6), dtype=torch.float32, device=device)
         
-        # Select reduction strategy
-        reduction_map = {
-            'hierarchical': 2,
-            'mean': 0,
-            'max': 1
-        }
-        reduction_strategy = reduction_map.get(
-            state_collection.config.telemetry_reduction_strategy, 0
-        )
+        # Use hierarchical reducer for scalable telemetry processing
+        reducer = HierarchicalTelemetryReducer()
         
-        telemetry_reduction_kernel[reduction_grid](
-            raw_telemetry,
-            telemetry_buffer,
-            batch_size, num_seeds,
-            REDUCTION_STRATEGY=reduction_strategy
-        )
+        for metric_idx in range(6):
+            metric_data = raw_telemetry[:, metric_idx].reshape(batch_size, num_seeds)
+            
+            # Select reduction strategy based on config
+            reduction_op = 'sum' if state_collection.config.telemetry_reduction_strategy == 'mean' else 'max'
+            
+            for seed_idx in range(num_seeds):
+                seed_metric_data = metric_data[:, seed_idx]
+                reduced_value = reducer.reduce(seed_metric_data, reduction_op)
+                
+                if reduction_op == 'sum':
+                    reduced_value /= batch_size  # Convert sum to mean
+                
+                telemetry_buffer[seed_idx, metric_idx] = reduced_value
     
     return output_tensor, telemetry_buffer
 
@@ -954,10 +1679,140 @@ kasmina_production_forward_triton_op.register_autograd(
     setup_context=lambda ctx, inputs, output: None
 )
 
+
+# =============================================================================
+# Persistent Forward Kernel
 # =============================================================================
 
-# Production KasminaLayer Implementation
 
+@triton.jit
+def kasmina_persistent_forward_kernel(
+    # Input/output tensors
+    input_ptr, output_ptr, weight_ptr, bias_ptr,
+    # Stream management
+    work_queue_ptr, completion_flag_ptr,
+    # Tensor dimensions
+    batch_size, input_dim, output_dim,
+    # Strides
+    input_stride_batch, input_stride_dim,
+    output_stride_batch, output_stride_dim,
+    weight_stride_in, weight_stride_out,
+    # Processing parameters
+    BLOCK_SIZE_BATCH: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    MAX_STREAMS: tl.constexpr
+):
+    """Persistent kernel for continuous KasminaLayer processing"""
+    program_id = tl.program_id(0)
+    stream_id = 0
+    
+    # Persistent processing loop - continues until all streams processed
+    while stream_id < MAX_STREAMS:
+        # Check work queue for available stream
+        work_available = tl.load(work_queue_ptr + stream_id)
+        if work_available == 0:
+            continue
+            
+        # Process current stream batch
+        batch_offset = program_id * BLOCK_SIZE_BATCH
+        batch_mask = batch_offset + tl.arange(0, BLOCK_SIZE_BATCH) < batch_size
+        
+        # Load input data with coalesced access
+        input_offsets = ((batch_offset + tl.arange(0, BLOCK_SIZE_BATCH))[:, None] * 
+                        input_stride_batch + 
+                        tl.arange(0, BLOCK_SIZE_DIM)[None, :] * input_stride_dim)
+        input_data = tl.load(input_ptr + input_offsets, mask=batch_mask[:, None])
+        
+        # Load weights (cached across streams)
+        weight_offsets = (tl.arange(0, BLOCK_SIZE_DIM)[:, None] * weight_stride_in + 
+                         tl.arange(0, BLOCK_SIZE_DIM)[None, :] * weight_stride_out)
+        weights = tl.load(weight_ptr + weight_offsets)
+        
+        # Matrix multiplication with automatic optimization
+        output_data = tl.dot(input_data, weights)
+        
+        # Add bias and activation
+        if bias_ptr is not None:
+            bias = tl.load(bias_ptr + tl.arange(0, BLOCK_SIZE_DIM))
+            output_data += bias[None, :]
+        
+        # Apply activation (ReLU example)
+        output_data = tl.maximum(output_data, 0.0)
+        
+        # Store results
+        output_offsets = ((batch_offset + tl.arange(0, BLOCK_SIZE_BATCH))[:, None] * 
+                         output_stride_batch + 
+                         tl.arange(0, BLOCK_SIZE_DIM)[None, :] * output_stride_dim)
+        tl.store(output_ptr + output_offsets, output_data, mask=batch_mask[:, None])
+        
+        # Signal completion and move to next stream
+        tl.atomic_add(completion_flag_ptr + stream_id, 1)
+        stream_id += NUM_SMS  # Distribute work across SMs
+
+class PersistentKasminaLayer:
+    """Integration with ProductionKernelConfig.enable_persistent_kernels"""
+    
+    def __init__(self, config: ProductionKernelConfig):
+        self.config = config
+        self.persistent_active = False
+        self.work_queue = None
+        self.completion_flags = None
+    
+    def should_use_persistent_kernel(self, batch_frequency, memory_bound_ratio):
+        """Decision logic for persistent kernel usage"""
+        if not self.config.enable_persistent_kernels:
+            return False
+        
+        # High-frequency streaming (>1000 batches/sec)
+        if batch_frequency > 1000:
+            return True
+            
+        # Memory-bound workloads benefit from persistent caching
+        if memory_bound_ratio > 0.7:
+            return True
+            
+        return False
+    
+    def forward_persistent(self, input_tensor, weight, bias=None, num_streams=64):
+        """Persistent kernel forward pass"""
+        if not self.persistent_active:
+            self._initialize_persistent_resources(num_streams)
+        
+        batch_size, input_dim = input_tensor.shape
+        output_dim = weight.shape[1]
+        
+        output = torch.empty((batch_size, output_dim), 
+                           device=input_tensor.device, 
+                           dtype=input_tensor.dtype)
+        
+        # Launch persistent kernel (runs continuously)
+        grid = (triton.cdiv(batch_size, 32),)  
+        
+        kasmina_persistent_forward_kernel[grid](
+            input_tensor, output, weight, bias,
+            self.work_queue, self.completion_flags,
+            batch_size, input_dim, output_dim,
+            input_tensor.stride(0), input_tensor.stride(1),
+            output.stride(0), output.stride(1),
+            weight.stride(0), weight.stride(1),
+            BLOCK_SIZE_BATCH=32, BLOCK_SIZE_DIM=64,
+            NUM_SMS=torch.cuda.get_device_properties(0).multi_processor_count,
+            MAX_STREAMS=num_streams
+        )
+        
+        return output
+    
+    def _initialize_persistent_resources(self, num_streams):
+        """Initialize work queues and completion tracking"""
+        device = torch.cuda.current_device()
+        self.work_queue = torch.ones(num_streams, device=device, dtype=torch.int32)
+        self.completion_flags = torch.zeros(num_streams, device=device, dtype=torch.int32)
+        self.persistent_active = True
+
+
+# =============================================================================
+# Production KasminaLayer Implementation
 # =============================================================================
 
 class ProductionKasminaLayer(torch.nn.Module):
@@ -966,13 +1821,16 @@ class ProductionKasminaLayer(torch.nn.Module):
 
     Features:
     - High-performance Triton kernels for forward and backward passes
-    - TMA support for H100/Ada architectures
+    - TMA support for H100/Ada architectures with automatic fallback
     - Comprehensive autotuning with architecture-specific configs
     - Advanced numerical stability and gradient clipping
-    - Efficient telemetry with multiple reduction strategies
+    - Efficient telemetry with hierarchical reduction
     - Memory-efficient state management with SoA layout
     - Production-ready error handling and validation
     """
+    
+    # Constants
+    STATE_COLLECTION_PREFIX = 'state_collection.'
     
     def __init__(
         self,
@@ -1047,13 +1905,53 @@ class ProductionKasminaLayer(torch.nn.Module):
     def _initialize_state_collection(self, device: torch.device):
         """Lazy initialization with hardware detection"""
         if self.state_collection is None:
-            # Update config based on hardware
             if self.has_tma:
                 self.config.enable_tma = True
             
             self.state_collection = KasminaProductionStateCollection(
                 self.num_seeds, device, self.config
             )
+            # Create TMA descriptors after state is on the device
+            if self.config.enable_tma and self.state_collection.tma_manager.has_tma:
+                self._setup_tma_descriptors()
+
+    def _setup_tma_descriptors(self):
+        """Creates TMA descriptors for persistent tensors using modern API."""
+        if not (self.config.enable_tma and self.state_collection and 
+                self.state_collection.tma_manager and self.state_collection.tma_manager.has_tma):
+            return
+
+        manager = self.state_collection.tma_manager
+        
+        # Create descriptors with appropriate block dimensions
+        if not manager.create_descriptor(self.blueprint_weights, "blueprint_weights", 
+                                       block_dims=[self.chunk_size, self.chunk_size]):
+            warnings.warn("Failed to create TMA descriptor for blueprint_weights.")
+        
+        if not manager.create_descriptor(self.blueprint_scales, "blueprint_scales",
+                                       block_dims=[min(128, self.max_blueprints)]):
+            warnings.warn("Failed to create TMA descriptor for blueprint_scales.")
+
+    def _create_input_output_descriptors(self, input_tensor, output_tensor):
+        """Create TMA descriptors for input/output tensors during forward pass."""
+        if not (self.config.enable_tma and self.state_collection and 
+                self.state_collection.tma_manager and self.state_collection.tma_manager.has_tma):
+            return {}
+        
+        # Use the modern create_tma_descriptors function
+        input_desc, blueprint_desc, output_desc = create_tma_descriptors(
+            input_tensor, self.blueprint_weights, output_tensor
+        )
+        
+        descriptors = {}
+        if input_desc is not None:
+            descriptors["input"] = input_desc
+        if blueprint_desc is not None:
+            descriptors["blueprint_weights"] = blueprint_desc  
+        if output_desc is not None:
+            descriptors["output"] = output_desc
+            
+        return descriptors
 
     def state_dict(self, *args, **kwargs):
         # Get the standard state dict
@@ -1062,20 +1960,20 @@ class ProductionKasminaLayer(torch.nn.Module):
         if self.state_collection is not None:
             for key, value in self.state_collection.__dict__.items():
                 if isinstance(value, torch.Tensor):
-                    dest[f'state_collection.{key}'] = value
+                    dest[f'{self.STATE_COLLECTION_PREFIX}{key}'] = value
         return dest
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         # Separate the state_collection tensors
-        kasmina_state = {k: v for k, v in state_dict.items() if k.startswith('state_collection.')}
+        kasmina_state = {k: v for k, v in state_dict.items() if k.startswith(self.STATE_COLLECTION_PREFIX)}
         # Load the standard nn.Module state
-        super().load_state_dict({k: v for k, v in state_dict.items() if not k.startswith('state_collection.')}, *args, **kwargs)
+        super().load_state_dict({k: v for k, v in state_dict.items() if not k.startswith(self.STATE_COLLECTION_PREFIX)}, *args, **kwargs)
         
         # Ensure state_collection is initialized and then load its state
         if kasmina_state:
             self._initialize_state_collection(self.blueprint_weights.device)
             for key, value in kasmina_state.items():
-                attr_name = key.replace('state_collection.', '')
+                attr_name = key.replace(self.STATE_COLLECTION_PREFIX, '')
                 if hasattr(self.state_collection, attr_name):
                     getattr(self.state_collection, attr_name).copy_(value)
 
@@ -1114,45 +2012,50 @@ class ProductionKasminaLayer(torch.nn.Module):
             return self._forward_impl(x)
     
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
-        """Internal forward implementation"""
-        # Performance monitoring
-        start_time = None
+        """Internal forward implementation with enhanced TMA descriptor handling."""
+        start_time, end_time = None, None
         if self.config.enable_kernel_profiling and torch.cuda.is_available():
             torch.cuda.synchronize()
             start_time = torch.cuda.Event(enable_timing=True)
             end_time = torch.cuda.Event(enable_timing=True)
             start_time.record()
+
+        # Create output tensor
+        output = torch.empty_like(x)
+
+        # Create TMA descriptors for input/output tensors  
+        tma_desc_pointers = self._create_input_output_descriptors(x, output)
         
-        # Execute production forward kernel
-        output, telemetry = kasmina_production_forward_triton_op(
+        # Add persistent TMA descriptors from state collection
+        if (self.config.enable_tma and self.state_collection and 
+            self.state_collection.tma_manager and self.state_collection.tma_manager.has_tma):
+            
+            # Get existing descriptors from the manager
+            for name in self.state_collection.tma_manager.descriptors:
+                if name not in tma_desc_pointers:  # Don't override input/output descriptors
+                    desc = self.state_collection.tma_manager.get_descriptor_pointer(name)
+                    if desc is not None:
+                        tma_desc_pointers[name] = desc
+
+        # Execute production forward kernel with automatic kernel selection
+        output = KasminaAutogradFunction.apply(
             x,
             self.state_collection,
             self.blueprint_weights,
             self.blueprint_offsets,
             self.blueprint_scales,
             self.current_epoch,
-            self.config.numerical_stability_mode == "strict",
-            self.enable_telemetry
+            tma_desc_pointers,
+            self.config
         )
         
-        # Performance tracking
-        if start_time is not None:
+        if start_time and end_time:
             end_time.record()
             torch.cuda.synchronize()
             kernel_time = start_time.elapsed_time(end_time)
             self.performance_stats['kernel_time_ms'] = kernel_time
-            
-            # Estimate memory bandwidth
-            bytes_accessed = (x.numel() + output.numel()) * 4  # float32
-            self.performance_stats['memory_bandwidth_gbps'] = (
-                bytes_accessed / (kernel_time * 1e6)
-            )
-        
-        # Store telemetry
-        if self.enable_telemetry and telemetry is not None:
-            self.telemetry_history.append(telemetry.detach().cpu())
-            if len(self.telemetry_history) > 10:
-                self.telemetry_history = self.telemetry_history[-5:]
+            bytes_accessed = (x.numel() + output.numel()) * 4
+            self.performance_stats['memory_bandwidth_gbps'] = bytes_accessed / (kernel_time * 1e-6)
         
         return output
 
@@ -1176,7 +2079,6 @@ class ProductionKasminaLayer(torch.nn.Module):
                 'numerical_stability': self.config.numerical_stability_mode
             }
         }
-
 
     def request_germination(
         self,

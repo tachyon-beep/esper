@@ -1,0 +1,21 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Tests",
+			"type": "shell",
+			"command": "${workspaceFolder}/env/bin/python",
+			"args": [
+				"-m",
+				"pytest",
+				"--cov=esper",
+				"--cov-report=term"
+			],
+			"group": "test",
+			"problemMatcher": [
+				"$pytest"
+			],
+			"isBackground": false
+		}
+	]
+}
